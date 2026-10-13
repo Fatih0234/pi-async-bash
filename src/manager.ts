@@ -130,6 +130,11 @@ export interface JobManagerOptions {
 	onReady?: (job: Job) => void;
 	/** Observer for display state: launch, handoff, stop request, finish. Never affects ownership. */
 	onChange?: (job: Job, change: JobChange) => void;
+	/**
+	 * Called once per job when finished-job retention eviction forgets it, after removal.
+	 * Runs inside `finish()`; never throws into the job lifecycle.
+	 */
+	onEvict?: (job: Job) => void;
 	now?: () => number;
 }
 
@@ -520,8 +525,8 @@ export function pruneSessionLogDirs(base: string, maxAgeMs: number, keep: string
 
 export class JobManager {
 	readonly logDir: string;
-	private readonly opts: Required<Omit<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange" | "eventLogPath">> &
-		Pick<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange" | "eventLogPath">;
+	private readonly opts: Required<Omit<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange" | "onEvict" | "eventLogPath">> &
+		Pick<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange" | "onEvict" | "eventLogPath">;
 	private readonly jobs = new Map<string, Job>();
 	/** Cleanup must outlive result release and completed-job retention eviction. */
 	private readonly pendingGroupCleanup = new Set<Job>();
@@ -897,6 +902,10 @@ export class JobManager {
 			const job = finished.shift()!;
 			this.deleteLog(job);
 			this.jobs.delete(job.id);
+			// Retention forgets jobs without notice: observers drop their own per-job state here.
+			try {
+				this.opts.onEvict?.(job);
+			} catch {}
 		}
 	}
 

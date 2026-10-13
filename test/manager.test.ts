@@ -170,6 +170,22 @@ describe("JobManager", () => {
 		assert.ok(mgr.get(jobs[2]!.id));
 	});
 
+	test("retention eviction reports each forgotten job through onEvict", async () => {
+		const evicted: string[] = [];
+		const { mgr } = make({ maxCompleted: 2, onEvict: (job) => void evicted.push(job.id) });
+		const jobs: Job[] = [];
+		for (let i = 0; i < 4; i++) {
+			const job = mgr.start({ command: `echo ${i}`, cwd: "/" });
+			await job.done;
+			jobs.push(job);
+		}
+		assert.deepEqual(evicted, [jobs[0]!.id, jobs[1]!.id]);
+		assert.equal(mgr.get(jobs[0]!.id), undefined);
+		assert.equal(mgr.get(jobs[1]!.id), undefined);
+		assert.ok(mgr.get(jobs[2]!.id));
+		assert.ok(mgr.get(jobs[3]!.id));
+	});
+
 	test("running job limit", async () => {
 		const { mgr } = make({ maxRunning: 1 });
 		const job = mgr.start({ command: "sleep 5", cwd: "/" });

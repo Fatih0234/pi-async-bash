@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { dirname, join } from "node:path";
 import { after, describe, test } from "node:test";
-import { NOTIFY_CUSTOM_TYPE, parseForegroundMs, resolveConfig, resolveForegroundMs, resolveTimeoutMs } from "../src/index.ts";
+import { __notifyPolicyForTest, NOTIFY_CUSTOM_TYPE, parseForegroundMs, resolveConfig, resolveForegroundMs, resolveTimeoutMs } from "../src/index.ts";
 import { FakeRuntime, text } from "./fake-pi.ts";
 import { alive, sleep, tempDir, waitFor } from "./helpers.ts";
 
@@ -550,7 +550,7 @@ describe("notifyPolicy hygiene (issue #3)", () => {
 		assert.strictEqual(noticeOf(rt).length, 0, "silent job still never wakes");
 	});
 
-	test("stop drops the entry after reporting it", async () => {
+	test("stop keeps the entry so later status stays truthful", async () => {
 		const rt = runtime("hygiene-stop");
 		const result = await rt.bash({ command: "sleep 30", run_in_background: true, notify: "silent" });
 		const jobId = result.details.jobId as string;
@@ -559,13 +559,14 @@ describe("notifyPolicy hygiene (issue #3)", () => {
 		const stopped = await rt.job({ action: "stop", job_id: jobId });
 		assert.match(text(stopped), /was stopped/);
 		assert.match(text(stopped), /Notify: silent/);
+		// The entry lives until retention eviction (or take): a re-query still reports the real policy.
 		const after = await rt.job({ action: "status", job_id: jobId });
-		assert.match(text(after), /Notify: wake/, "policy entry is gone after stop");
+		assert.match(text(after), /Notify: silent/, "stopped silent job still reports its real policy");
 		await sleep(400);
 		assert.strictEqual(noticeOf(rt).length, 0, "stopped job is not re-announced");
 	});
 
-	test("wait drops the entry for a settled job but keeps it while running", async () => {
+	test("wait keeps the entry so later status stays truthful", async () => {
 		const rt = runtime("hygiene-wait");
 		const result = await rt.bash({ command: "sleep 0.4; echo wait-hygiene", run_in_background: true, notify: "silent" });
 		const jobId = result.details.jobId as string;
@@ -573,8 +574,9 @@ describe("notifyPolicy hygiene (issue #3)", () => {
 		const waited = await rt.job({ action: "wait", job_id: jobId, timeout: 5 });
 		assert.match(text(waited), /wait-hygiene/);
 		assert.match(text(waited), /Notify: silent/);
+		// The entry lives until retention eviction (or take): a re-query still reports the real policy.
 		const after = await rt.job({ action: "status", job_id: jobId });
-		assert.match(text(after), /Notify: wake/, "policy entry is gone after wait consumed the settled job");
+		assert.match(text(after), /Notify: silent/, "waited silent job still reports its real policy");
 		assert.strictEqual(noticeOf(rt).length, 0, "silent job still never wakes");
 	});
 
@@ -616,6 +618,140 @@ describe("notifyPolicy hygiene (issue #3)", () => {
 		assert.equal(noticeOf(rt).length, 1, "exactly one completion notice");
 		assert.match(noticeOf(rt)[0]!.message.content, /wake-hygiene/);
 		assert.match(text(await rt.job({ action: "status", job_id: result.details.jobId })), /Notify: wake/);
+	});
+});
+
+describe("notifyPolicy eviction hook (issue #3 round 2)", () => {
+	/** Poll until a retained job settles. Status merely observes, so entries stay put in every design. */
+	async function waitSettled(rt: FakeRuntime, jobId: string, what: string): Promise<void> {
+		const deadline = Date.now() + 15000;
+		for (;;) {
+			const s = text(await rt.job({ action: "status", job_id: jobId }));
+			if (/exited with code 0/.test(s)) return;
+			if (Date.now() > deadline) throw new Error(`timed out waiting for ${what} to settle: ${s}`);
+			await sleep(20);
+		}
+	}
+
+	/**
+	 * Poll until the manager forgot this id. Eviction is oldest-first, so this id being
+	 * unknown implies every older id is evicted too. Never probe the id under assertion:
+	 * the Unknown path deletes the probed id's entry.
+	 */
+	async function waitEvicted(rt: FakeRuntime, jobId: string): Promise<void> {
+		const deadline = Date.now() + 10000;
+		for (;;) {
+			try {
+				await rt.job({ action: "status", job_id: jobId });
+			} catch (err) {
+				assert.match((err as Error).message, /Unknown job/);
+				return;
+			}
+			if (Date.now() > deadline) throw new Error(`timed out waiting for ${jobId} to be evicted`);
+			await sleep(20);
+		}
+	}
+
+	test("status-only silent workload leaves no residue after eviction", async () => {
+		const marker = __notifyPolicyForTest.length;
+		const rt = runtime("hook-status-only");
+		const policies = __notifyPolicyForTest[marker]!;
+		const ids: string[] = [];
+		for (let i = 0; i < 40; i++) {
+			const result = await rt.bash({ command: "true", run_in_background: true, notify: "silent" });
+			ids.push(result.details.jobId as string);
+			// Settle each launch without spending its entry (no wait/list): retention
+			// counts finished jobs and running slots stay free.
+			await sleep(30);
+		}
+		await waitSettled(rt, ids[ids.length - 1]!, "newest of first batch");
+		// Status merely observes: every retained job still reports its real policy.
+		// (40 < 50, so no eviction can interleave with these polls.)
+		for (const id of ids) assert.match(text(await rt.job({ action: "status", job_id: id })), /Notify: silent/);
+		for (let i = 0; i < 15; i++) {
+			const result = await rt.bash({ command: "true", run_in_background: true, notify: "silent" });
+			ids.push(result.details.jobId as string);
+			await sleep(30);
+		}
+		await waitSettled(rt, ids[ids.length - 1]!, "newest filler");
+		await sleep(300);
+		await waitEvicted(rt, ids[1]!);
+		assert.equal(policies.has(ids[0]!), false, "status-polled entry dies at eviction");
+		assert.ok(policies.size <= 50, `map stays bounded by the job cap (got ${policies.size})`);
+		// Retained jobs stay truthful under eviction pressure.
+		assert.match(text(await rt.job({ action: "status", job_id: ids[ids.length - 1]! })), /Notify: silent/);
+		assert.strictEqual(noticeOf(rt).length, 0, "silent jobs never wake");
+	});
+
+	test("unobserved eviction cleans the map without any list call", async () => {
+		const marker = __notifyPolicyForTest.length;
+		const rt = runtime("hook-evict");
+		const policies = __notifyPolicyForTest[marker]!;
+		const ids: string[] = [];
+		for (let i = 0; i < 55; i++) {
+			const result = await rt.bash({ command: "true", run_in_background: true, notify: "silent" });
+			ids.push(result.details.jobId as string);
+			await sleep(30);
+		}
+		// Deliberately no list call anywhere in this test: the eviction hook, not list
+		// reconciliation, must clean entries for jobs the manager forgot.
+		await waitSettled(rt, ids[ids.length - 1]!, "newest filler");
+		await sleep(300);
+		await waitEvicted(rt, ids[1]!);
+		assert.equal(policies.has(ids[0]!), false, "evicted silent entry dies without any list call");
+		assert.ok(policies.size <= 50, `map stays bounded by the job cap (got ${policies.size})`);
+		assert.strictEqual(noticeOf(rt).length, 0, "silent jobs never wake");
+	});
+
+	test("stop-then-status re-query stays truthful for silent jobs", async () => {
+		const rt = runtime("hook-stop-truth");
+		const result = await rt.bash({ command: "sleep 30", run_in_background: true, notify: "silent" });
+		const jobId = result.details.jobId as string;
+		assert.match(text(await rt.job({ action: "status", job_id: jobId })), /Notify: silent/);
+		const stopped = await rt.job({ action: "stop", job_id: jobId });
+		assert.match(text(stopped), /Notify: silent/);
+		assert.match(
+			text(await rt.job({ action: "status", job_id: jobId })),
+			/Notify: silent/,
+			"stopped silent job still reports its real policy",
+		);
+		await sleep(400);
+		assert.strictEqual(noticeOf(rt).length, 0, "stopped silent job never wakes");
+	});
+
+	test("status-before-flush wake entry still dies at eviction", async () => {
+		const marker = __notifyPolicyForTest.length;
+		const rt = runtime("hook-flush");
+		const policies = __notifyPolicyForTest[marker]!;
+		rt.idle = false; // defer the idle flush so status observes the settle first
+		const result = await rt.bash({ command: "sleep 0.4; echo flush-wake", run_in_background: true, notify: "wake" });
+		const jobId = result.details.jobId as string;
+		// Settle while busy: the completion sits in pending until status marks it delivered.
+		const settleDeadline = Date.now() + 10000;
+		for (;;) {
+			const s = text(await rt.job({ action: "status", job_id: jobId }));
+			if (/flush-wake/.test(s)) {
+				assert.match(s, /Notify: wake/);
+				break;
+			}
+			if (Date.now() > settleDeadline) throw new Error(`timed out waiting for wake job to settle: ${s}`);
+			await sleep(20);
+		}
+		rt.idle = true;
+		await sleep(1400); // the deferred flush fires, finds it delivered, drops it quietly
+		assert.strictEqual(noticeOf(rt).length, 0, "status-observed completion is not re-announced");
+		const fillers: string[] = [];
+		for (let i = 0; i < 52; i++) {
+			const f = await rt.bash({ command: "true", run_in_background: true, notify: "silent" });
+			fillers.push(f.details.jobId as string);
+			await sleep(30);
+		}
+		await waitSettled(rt, fillers[fillers.length - 1]!, "newest filler");
+		await sleep(300);
+		await waitEvicted(rt, fillers[1]!);
+		assert.equal(policies.has(jobId), false, "status-observed wake entry dies at eviction");
+		assert.ok(policies.size <= 50, `map stays bounded by the job cap (got ${policies.size})`);
+		assert.strictEqual(noticeOf(rt).length, 0, "wake job observed via status never re-wakes");
 	});
 });
 

@@ -161,6 +161,13 @@ export function resolveConfig(
 
 export type NotifyPolicy = "wake" | "silent";
 
+/**
+ * Test seam for issue #3: every extension instance's per-call wake-policy map, in creation
+ * order. Lingering entries for evicted jobs are unobservable through tool outputs (job ids
+ * are never reused), so hygiene tests assert on the map directly. Production code never reads this.
+ */
+export const __notifyPolicyForTest: Map<string, NotifyPolicy>[] = [];
+
 /** Validate the per-call wake policy: `undefined` defaults to `"wake"`. */
 export function resolveNotify(value: unknown): NotifyPolicy {
 	if (value === undefined) return "wake";
@@ -335,6 +342,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	const userStopped = new Set<string>();
 	/** Per-call wake policy by job id; absent means `"wake"` (the default). */
 	const notifyPolicy = new Map<string, NotifyPolicy>();
+	__notifyPolicyForTest.push(notifyPolicy);
 	const notifyOfJob = (jobId: string): NotifyPolicy => notifyPolicy.get(jobId) ?? "wake";
 
 	const getConfig = (ctx?: ExtensionContext): AsyncBashConfig => {
@@ -418,6 +426,12 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				onChange: (job) => {
 					if (disposed || managerSessionId !== owner.sessionId) return;
 					board.changed(job.id);
+				},
+				// Retention eviction forgets jobs without notice: the policy entry dies with
+				// the job, so entries live exactly as long as the manager retains the job
+				// and the map stays bounded by the job cap on every path.
+				onEvict: (job) => {
+					notifyPolicy.delete(job.id);
 				},
 			});
 			manager = created;
@@ -931,9 +945,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				const text = job.running
 					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath} Notify: ${notify}.`
 					: `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
-				// The outcome (or its pending stop) was just reported and delivery is marked;
-				// the policy entry is spent.
-				notifyPolicy.delete(job.id);
+				// The entry stays until retention eviction (or take): the map is bounded by
+				// the job cap through the eviction hook, and a later status re-query must
+				// still report the real policy.
 				return { content: [{ type: "text", text }], details: { ...job.info(), notify } };
 			}
 
@@ -957,9 +971,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			const info = job.info();
 			const notify = notifyOfJob(job.id);
 			const text = `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
-			// wait takes ownership of the settled outcome; status merely observes and must
-			// keep reporting the policy truthfully, so only wait spends the entry.
-			if (params.action === "wait") notifyPolicy.delete(job.id);
+			// Both wait and status merely observe the settled outcome; the entry stays until
+			// retention eviction (or take) so later re-queries stay truthful. The eviction
+			// hook keeps the map bounded by the job cap.
 			return { content: [{ type: "text", text }], details: { ...info, notify } };
 		},
 	});
