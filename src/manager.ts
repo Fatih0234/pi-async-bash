@@ -50,6 +50,8 @@ export interface JobEvent {
 	command: string;
 	status?: JobStatus;
 	exitCode?: number | null;
+	/** Optional caller-supplied link (issue #8, experimental): recorded verbatim, never parsed. */
+	task_id?: string;
 	ts: number;
 }
 
@@ -60,6 +62,12 @@ export interface JobSpec {
 	displayCommand?: string;
 	/** Optional short human-readable label, for display only. */
 	description?: string;
+	/**
+	 * Optional caller-supplied task link (issue #8, experimental). Recorded verbatim
+	 * as `task_id` on the job's event-log lines only; the manager never interprets it.
+	 * Empty/undefined means no link (no field at all).
+	 */
+	taskId?: string;
 	cwd: string;
 	env?: NodeJS.ProcessEnv;
 	/** Hard execution deadline in milliseconds, measured from launch. */
@@ -184,6 +192,8 @@ export class Job {
 	/** @internal */ readyDecoder: StringDecoder | undefined;
 	/** @internal */ readyScannedBytes = 0;
 	/** @internal */ readyTimer: NodeJS.Timeout | undefined;
+	/** Caller-supplied task link, recorded verbatim on event lines (issue #8). */
+	readonly taskId: string | undefined;
 	/** @internal */ resolveDone!: (info: JobInfo) => void;
 	/** @internal */ resolveLaunched!: (ok: boolean) => void;
 
@@ -195,6 +205,7 @@ export class Job {
 		this.logPath = logPath;
 		this.startedAt = startedAt;
 		this.timeoutMs = spec.timeoutMs;
+		this.taskId = spec.taskId ? spec.taskId : undefined;
 		this.readySource = spec.readyPattern;
 		this.owner = spec.background ? "background" : "foreground";
 		this.done = new Promise((resolve) => {
@@ -821,10 +832,11 @@ export class JobManager {
 	private appendJobEvent(job: Job, event: JobEvent["event"]): void {
 		const path = this.opts.eventLogPath;
 		if (!path) return;
+		const taskLink = job.taskId ? { task_id: job.taskId } : {};
 		const entry: JobEvent =
 			event === "started"
-				? { event, job_id: job.id, command: job.command, ts: this.opts.now() }
-				: { event, job_id: job.id, command: job.command, status: job.status, exitCode: job.exitCode, ts: this.opts.now() };
+				? { event, job_id: job.id, command: job.command, ...taskLink, ts: this.opts.now() }
+				: { event, job_id: job.id, command: job.command, status: job.status, exitCode: job.exitCode, ...taskLink, ts: this.opts.now() };
 		try {
 			fs.mkdirSync(dirname(path), { recursive: true });
 			fs.appendFileSync(path, `${JSON.stringify(entry)}\n`);

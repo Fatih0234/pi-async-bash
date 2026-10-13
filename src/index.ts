@@ -198,6 +198,28 @@ export function resolveTimeoutMs(timeout: number | undefined): number | undefine
 	return ms;
 }
 
+/**
+ * Validate the optional per-call task link (issue #8, experimental). Recorded verbatim
+ * as `task_id` on the job's event-log lines only; never parsed or normalized.
+ * `undefined` and `""` both mean no link (no field at all). Rejects overlong values
+ * (>256 chars, never truncated silently) and control characters (newlines would break
+ * the JSONL one-object-per-line contract; the value must survive encoding unchanged).
+ */
+export function resolveTaskId(value: unknown): string | undefined {
+	if (value === undefined || value === "") return undefined;
+	if (typeof value !== "string") {
+		throw new Error(`Invalid task_id ${JSON.stringify(value)}: must be a string`);
+	}
+	if (value.length > 256) {
+		throw new Error(`Invalid task_id: must be at most 256 characters, got ${value.length}`);
+	}
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: the rejected set is the point
+	if (/[\x00-\x1F\x7F]/.test(value)) {
+		throw new Error("Invalid task_id: must not contain control characters (newlines break the JSONL event log)");
+	}
+	return value;
+}
+
 /** Validate the per-call readiness pattern: `undefined` arms no watch, otherwise a JS regex source. */
 export function resolveReadyPattern(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
@@ -254,6 +276,12 @@ const bashSchema = Type.Object({
 		Type.Number({
 			description:
 				"Seconds to watch for ready_pattern before the watch expires silently; the job keeps running either way.",
+		}),
+	),
+	task_id: Type.Optional(
+		Type.String({
+				description:
+				"Optional task link (experimental): recorded verbatim as task_id on this job's event-log lines only. Max 256 chars, no control characters.",
 		}),
 	),
 });
@@ -834,6 +862,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			const notify = resolveNotify(params.notify);
 			const readyPattern = resolveReadyPattern(params.ready_pattern);
 			const readyTimeoutMs = resolveReadyTimeoutMs(params.ready_timeout_s);
+			const taskId = resolveTaskId(params.task_id);
 			if (readyTimeoutMs !== undefined && readyPattern === undefined) {
 				throw new Error("Invalid ready_timeout_s: requires ready_pattern");
 			}
@@ -850,6 +879,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				background: params.run_in_background === true,
 				readyPattern,
 				readyTimeoutMs,
+				taskId,
 			});
 			notifyPolicy.set(job.id, notify);
 
@@ -859,7 +889,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 					const info = job.info();
 					mgr.release(job);
 					notifyPolicy.delete(job.id);
-					throw new Error(errorForStatus(info));
+					throw new Error(withEventLogWarning(errorForStatus(info)!));
 				}
 				return runningResult(job, "explicit");
 			}

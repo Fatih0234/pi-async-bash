@@ -697,6 +697,37 @@ describe("eventLogPath startup validation (issue #4)", () => {
 	});
 });
 
+describe("task_id event linkage (issue #8, manager)", () => {
+	test("task_id is recorded verbatim on started+settled", async () => {
+		const dir = tempDir();
+		const logPath = join(dir, "events.jsonl");
+		const { mgr } = make({ eventLogPath: logPath });
+		const job = mgr.start({ command: "echo hi", cwd: "/", taskId: "my-task-42" });
+		await job.done;
+		const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+		assert.strictEqual(lines.length, 2);
+		const started = JSON.parse(lines[0]!);
+		const settled = JSON.parse(lines[1]!);
+		assert.equal(started.task_id, "my-task-42");
+		assert.equal(settled.task_id, "my-task-42");
+	});
+
+	test("omitted task_id leaves no field (byte-identical to today)", async () => {
+		const dir = tempDir();
+		const logPath = join(dir, "events.jsonl");
+		const { mgr } = make({ eventLogPath: logPath });
+		const job = mgr.start({ command: "echo hi", cwd: "/" });
+		await job.done;
+		const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+		assert.strictEqual(lines.length, 2);
+		const started = JSON.parse(lines[0]!);
+		const settled = JSON.parse(lines[1]!);
+		assert.ok(!("task_id" in started), "started carries no task_id when omitted");
+		assert.ok(!("task_id" in settled), "settled carries no task_id when omitted");
+		assert.deepStrictEqual(Object.keys(started).sort(), ["command", "event", "job_id", "ts"]);
+	});
+});
+
 describe("coverage gaps (issue #7)", () => {
 	test("settled exitCode null (spawn_error) event shape", async () => {
 		const dir = tempDir();

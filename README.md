@@ -50,7 +50,7 @@ For a budget that survives new shells, prefer the `asyncBash.foregroundMs` Pi se
 
 Set `PI_ASYNC_BASH_EVENT_LOG=/path/to/events.jsonl` to record every job as
 one JSON object per line:
-`{"event":"started"|"settled","job_id","command","status?","exitCode?","ts"}`.
+`{"event":"started"|"settled","job_id","command","status?","exitCode?","task_id?","ts"}`.
 Each event is a single append; parent directories are created as needed, and
 log I/O failures never break jobs. Consumer contract: read whole lines,
 parse each as JSON; `started` carries no `status` and no `exitCode`,
@@ -58,6 +58,13 @@ parse each as JSON; `started` carries no `status` and no `exitCode`,
 (numeric: `0` for a clean exit, `128+n` on signal kill;
 `null` only when the process never started, i.e. `spawn_error`),
 `ts` is epoch milliseconds.
+
+`task_id` (experimental, pilot precursor to #9): pass `task_id` to `bash` and
+the exact string is recorded verbatim on that job's `started` and `settled`
+lines — the only place the link lives (no task-store writes, no new coupling).
+Omitted or empty means no field at all. Values over 256 chars or containing
+control characters (including newlines) are rejected with a validation error
+and never truncated.
 
 Jobs belong to the session: **quitting, switching sessions, or reloading stops them**. In print/JSON mode, handoff is opt-in: `--bash-foreground-ms <ms>`, `PI_ASYNC_BASH_FOREGROUND_MS=<ms>`, or the `asyncBash.foregroundMs` setting (e.g. 2000); pending job results are delivered before the run exits. Stop unneeded servers and watchers before finishing. Process cleanup covers the process group, not escaped daemons.
 

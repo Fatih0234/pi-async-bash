@@ -35,6 +35,7 @@ describe("registration and config", () => {
 			"ready_pattern",
 			"ready_timeout_s",
 			"run_in_background",
+			"task_id",
 			"timeout",
 		]);
 		assert.deepEqual(params.required, ["command"]);
@@ -1035,5 +1036,102 @@ describe("coverage gaps (issue #7)", () => {
 		const stoppedText = text(stopped);
 		assert.match(stoppedText, /exited with code 0/, "stop reports the recorded outcome");
 		assert.doesNotMatch(stoppedText, /was stopped/, "stop never synthesizes stopped after exit");
+	});
+});
+
+describe("explicit-background spawn failure warning (issue #13)", () => {
+	test("bg spawn failure carries the event-log warning for parity with foreground", async () => {
+		const dir = tempDir("pab-evt-bgspawn-");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = dir; // a directory, not a file: logging disabled with warning
+		try {
+			const rt = runtime("evt-bg-spawn");
+			rt.settings.shellPath = dir; // exists but not executable: spawn fails with EACCES
+			await assert.rejects(rt.bash({ command: "echo hi", run_in_background: true }), (err: unknown) => {
+				const message = (err as Error).message;
+				assert.match(message, /failed to start/, "spawn failure is reported");
+				assert.match(message, /event log disabled/, "warning present on the bg-spawn-failure path");
+				return true;
+			});
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+});
+
+describe("task_id event linkage (issue #8, extension)", () => {
+	test("task_id is present verbatim on started+settled", async () => {
+		const dir = tempDir("pab-taskid-");
+		const logPath = join(dir, "events.jsonl");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = logPath;
+		try {
+			const rt = runtime("taskid-verbatim");
+			const result = await rt.bash({ command: "echo hi", task_id: "my-task-42" });
+			assert.equal(text(result), "hi");
+			const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+			assert.strictEqual(lines.length, 2);
+			const started = JSON.parse(lines[0]!);
+			const settled = JSON.parse(lines[1]!);
+			assert.equal(started.task_id, "my-task-42");
+			assert.equal(settled.task_id, "my-task-42");
+			assert.equal(settled.job_id, started.job_id);
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+
+	test("omitted task_id leaves no field at all", async () => {
+		const dir = tempDir("pab-taskid-omit-");
+		const logPath = join(dir, "events.jsonl");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = logPath;
+		try {
+			const rt = runtime("taskid-omitted");
+			await rt.bash({ command: "echo hi" });
+			const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+			assert.strictEqual(lines.length, 2);
+			const started = JSON.parse(lines[0]!);
+			const settled = JSON.parse(lines[1]!);
+			assert.ok(!("task_id" in started), "started carries no task_id when omitted");
+			assert.ok(!("task_id" in settled), "settled carries no task_id when omitted");
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+
+	test("empty task_id is treated as omitted", async () => {
+		const dir = tempDir("pab-taskid-empty-");
+		const logPath = join(dir, "events.jsonl");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = logPath;
+		try {
+			const rt = runtime("taskid-empty");
+			await rt.bash({ command: "echo hi", task_id: "" });
+			const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+			assert.strictEqual(lines.length, 2);
+			const started = JSON.parse(lines[0]!);
+			const settled = JSON.parse(lines[1]!);
+			assert.ok(!("task_id" in started), "started carries no task_id for empty string");
+			assert.ok(!("task_id" in settled), "settled carries no task_id for empty string");
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+
+	test("overlong task_id is rejected, never truncated", async () => {
+		const rt = runtime("taskid-long");
+		await assert.rejects(rt.bash({ command: "echo hi", task_id: "x".repeat(257) }), /Invalid task_id.*256/);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+
+	test("task_id with newline is rejected (JSONL must survive unchanged)", async () => {
+		const rt = runtime("taskid-newline");
+		await assert.rejects(rt.bash({ command: "echo hi", task_id: "abc\ndef" }), /Invalid task_id/);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+
+	test("task_id with control characters is rejected", async () => {
+		const rt = runtime("taskid-control");
+		await assert.rejects(rt.bash({ command: "echo hi", task_id: "abc\u0001def" }), /Invalid task_id/);
+		await assert.rejects(rt.bash({ command: "echo hi", task_id: "abc\rdef" }), /Invalid task_id/);
+		await assert.rejects(rt.bash({ command: "echo hi", task_id: "abc\tdef" }), /Invalid task_id/);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
 	});
 });
