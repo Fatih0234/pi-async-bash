@@ -532,6 +532,93 @@ describe("notify policy", () => {
 	});
 });
 
+describe("notifyPolicy hygiene (issue #3)", () => {
+	test("settled entries survive passive status polls and silent still never wakes", async () => {
+		const rt = runtime("hygiene-settle");
+		const result = await rt.bash({ command: "sleep 0.5; echo settle-hygiene", notify: "silent" });
+		assert.equal(result.details.background, true);
+		const jobId = result.details.jobId as string;
+		await sleep(1200);
+		// status merely observes: repeated polls keep reporting the policy truthfully.
+		const first = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(first), /settle-hygiene/);
+		assert.match(text(first), /Notify: silent/);
+		const second = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(second), /Notify: silent/);
+		assert.match(text(await rt.job({ action: "list" })), new RegExp(`${jobId}.*notify:silent`));
+		assert.deepEqual(await rt.emit("turn_end", { outcome: "completed" }), [undefined]);
+		assert.strictEqual(noticeOf(rt).length, 0, "silent job still never wakes");
+	});
+
+	test("stop drops the entry after reporting it", async () => {
+		const rt = runtime("hygiene-stop");
+		const result = await rt.bash({ command: "sleep 30", run_in_background: true, notify: "silent" });
+		const jobId = result.details.jobId as string;
+		// While running the entry must stay: delivery still depends on it.
+		assert.match(text(await rt.job({ action: "status", job_id: jobId })), /Notify: silent/);
+		const stopped = await rt.job({ action: "stop", job_id: jobId });
+		assert.match(text(stopped), /was stopped/);
+		assert.match(text(stopped), /Notify: silent/);
+		const after = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(after), /Notify: wake/, "policy entry is gone after stop");
+		await sleep(400);
+		assert.strictEqual(noticeOf(rt).length, 0, "stopped job is not re-announced");
+	});
+
+	test("wait drops the entry for a settled job but keeps it while running", async () => {
+		const rt = runtime("hygiene-wait");
+		const result = await rt.bash({ command: "sleep 0.4; echo wait-hygiene", run_in_background: true, notify: "silent" });
+		const jobId = result.details.jobId as string;
+		assert.match(text(await rt.job({ action: "status", job_id: jobId })), /Notify: silent/);
+		const waited = await rt.job({ action: "wait", job_id: jobId, timeout: 5 });
+		assert.match(text(waited), /wait-hygiene/);
+		assert.match(text(waited), /Notify: silent/);
+		const after = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(after), /Notify: wake/, "policy entry is gone after wait consumed the settled job");
+		assert.strictEqual(noticeOf(rt).length, 0, "silent job still never wakes");
+	});
+
+	test("retention eviction still forgets jobs and list reconciles hygiene", async () => {
+		const rt = runtime("hygiene-evict");
+		const ids: string[] = [];
+		for (let i = 0; i < 52; i++) {
+			const result = await rt.bash({ command: "true", run_in_background: true, notify: "silent" });
+			ids.push(result.details.jobId as string);
+			// Settle each launch: retention counts finished jobs and running slots stay free.
+			await rt.job({ action: "wait", job_id: result.details.jobId, timeout: 5 });
+		}
+		// Retention keeps only the newest 50 finished jobs; the oldest are evicted.
+		const deadline = Date.now() + 5000;
+		for (;;) {
+			let evicted = false;
+			try {
+				await rt.job({ action: "status", job_id: ids[0]! });
+			} catch (err) {
+				assert.match((err as Error).message, /Unknown job/);
+				evicted = true;
+			}
+			if (evicted) break;
+			if (Date.now() > deadline) throw new Error("timed out waiting for oldest job to be evicted");
+			await sleep(20);
+		}
+		const list = await rt.job({ action: "list" });
+		assert.ok((list.details?.jobs?.length ?? 0) <= 50, "retention still bounds visible jobs");
+		await assert.rejects(rt.job({ action: "status", job_id: ids[0]! }), /Unknown job/);
+		assert.match(text(await rt.job({ action: "status", job_id: ids[ids.length - 1]! })), /exited with code 0/);
+	});
+
+	test("wake delivery is unchanged when the entry is spent at take", async () => {
+		const rt = runtime("hygiene-wake");
+		const result = await rt.bash({ command: "sleep 0.5; echo wake-hygiene", notify: "wake" });
+		assert.equal(result.details.background, true);
+		await waitFor(() => noticeOf(rt).length === 1, 3000, "wake notification");
+		await sleep(300);
+		assert.equal(noticeOf(rt).length, 1, "exactly one completion notice");
+		assert.match(noticeOf(rt)[0]!.message.content, /wake-hygiene/);
+		assert.match(text(await rt.job({ action: "status", job_id: result.details.jobId })), /Notify: wake/);
+	});
+});
+
 
 describe("readiness watch", () => {
 	test("a matching line wakes once while the job keeps running", async () => {

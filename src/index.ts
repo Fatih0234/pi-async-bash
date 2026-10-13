@@ -445,6 +445,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		const jobs = pending.filter((job) => !job.delivered && notifyOfJob(job.id) !== "silent");
 		pending = [];
 		for (const job of jobs) job.delivered = true;
+		// A delivered completion never wakes again; the policy entry is spent.
+		for (const job of jobs) notifyPolicy.delete(job.id);
 		return jobs;
 	};
 
@@ -461,6 +463,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		);
 		for (const job of readyPending) job.readyDelivered = true;
 		readyPending = [];
+		// A delivered ready notice never wakes again; the policy entry is spent.
+		for (const job of jobs) notifyPolicy.delete(job.id);
 		return jobs;
 	};
 
@@ -889,6 +893,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			// Foreground completions kept only for their logs are not jobs the model manages.
 			const listed = (job: Job | undefined) => (job?.owner === "background" ? job : undefined);
 			if (params.action === "list") {
+				// Retention eviction forgets jobs without notice: drop policies for jobs the
+				// manager no longer knows, so the map stays bounded by live jobs.
+				if (mgr) for (const id of [...notifyPolicy.keys()]) if (!mgr.get(id)) notifyPolicy.delete(id);
 				const jobs = (mgr?.list() ?? []).filter((job) => listed(job));
 				if (jobs.length === 0) return { content: [{ type: "text", text: "No background jobs in this session." }], details: undefined };
 				const now = Date.now();
@@ -903,7 +910,11 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			}
 			if (!params.job_id) throw new Error(`job_id is required for ${params.action}`);
 			const job = listed(mgr?.get(params.job_id));
-			if (!mgr || !job) throw new Error(`Unknown job ${params.job_id} (jobs belong to the current session; finished jobs are kept for a limited time).`);
+			if (!mgr || !job) {
+				// The job is gone (evicted or never in this session): its policy entry is spent too.
+				if (params.job_id) notifyPolicy.delete(params.job_id);
+				throw new Error(`Unknown job ${params.job_id} (jobs belong to the current session; finished jobs are kept for a limited time).`);
+			}
 
 			if (params.action === "stop") {
 				// Delegates truthfulness to the manager's first-reason-wins requestStop:
@@ -920,6 +931,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				const text = job.running
 					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath} Notify: ${notify}.`
 					: `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
+				// The outcome (or its pending stop) was just reported and delivery is marked;
+				// the policy entry is spent.
+				notifyPolicy.delete(job.id);
 				return { content: [{ type: "text", text }], details: { ...job.info(), notify } };
 			}
 
@@ -930,6 +944,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			}
 
 			if (job.running) {
+				// Still running: keep the entry, a later completion still needs the policy.
 				const tail = mgr.tail(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES);
 				const notify = notifyOfJob(job.id);
 				const text = [
@@ -942,6 +957,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			const info = job.info();
 			const notify = notifyOfJob(job.id);
 			const text = `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
+			// wait takes ownership of the settled outcome; status merely observes and must
+			// keep reporting the policy truthfully, so only wait spends the entry.
+			if (params.action === "wait") notifyPolicy.delete(job.id);
 			return { content: [{ type: "text", text }], details: { ...info, notify } };
 		},
 	});
