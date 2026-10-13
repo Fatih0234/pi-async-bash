@@ -5,12 +5,14 @@ import { join } from "node:path";
 import { after, describe, test } from "node:test";
 import {
 	cleanOutput,
+	compileReadyPattern,
 	createSessionLogDir,
 	type Job,
 	JobManager,
 	type JobManagerOptions,
 	pruneSessionLogDirs,
 	readLogTail,
+	ReadyLineMatcher,
 } from "../src/manager.ts";
 import { alive, sleep, tempDir, waitFor } from "./helpers.ts";
 
@@ -416,5 +418,31 @@ describe("log helpers", () => {
 		pruneSessionLogDirs(base, 86400_000, live);
 		assert.equal(fs.existsSync(old), false);
 		assert.equal(fs.existsSync(live), true);
+	});
+});
+
+describe("readiness line matcher", () => {
+	test("fires once, on the second line only", () => {
+		// lines ["starting", "listening on :3000"] with pattern "listening on :\\d+" fires once, on the second line only
+		const matcher = new ReadyLineMatcher(compileReadyPattern("listening on :\\d+"));
+		const fired: number[] = [];
+		fired.push(...matcher.push("starting\n"));
+		fired.push(...matcher.push("listening on :3000\n"));
+		fired.push(...matcher.push("listening on :3001\n"));
+		assert.deepStrictEqual(fired, [1]);
+	});
+
+	test("a line split across chunks matches once when it completes", () => {
+		const matcher = new ReadyLineMatcher(compileReadyPattern("ready on :\\d+"));
+		const fired: number[] = [];
+		fired.push(...matcher.push("booting\nready on :51"));
+		fired.push(...matcher.push("73\n"));
+		assert.deepStrictEqual(fired, [1]);
+		assert.equal(matcher.matchedLine, "ready on :5173");
+	});
+
+	test("invalid regex is rejected with the pattern echoed back", () => {
+		assert.throws(() => compileReadyPattern("listening on :("), /Invalid ready_pattern.*"listening on :\("/);
+		assert.throws(() => compileReadyPattern(""), /Invalid ready_pattern/);
 	});
 });

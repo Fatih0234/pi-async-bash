@@ -19,6 +19,7 @@ import { waitForBackgroundResult } from "./headless.ts";
 
 type ExtensionMode = ExtensionContext["mode"];
 import {
+	compileReadyPattern,
 	createSessionLogDir,
 	type Job,
 	type JobInfo,
@@ -172,6 +173,27 @@ export function resolveTimeoutMs(timeout: number | undefined): number | undefine
 	return ms;
 }
 
+/** Validate the per-call readiness pattern: `undefined` arms no watch, otherwise a JS regex source. */
+export function resolveReadyPattern(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		throw new Error(`Invalid ready_pattern ${JSON.stringify(value)}: must be a string (JS regex source)`);
+	}
+	compileReadyPattern(value); // throws with the pattern echoed back
+	return value;
+}
+
+/** Validate the per-call readiness watch window in seconds; `undefined` watches until the job ends. */
+export function resolveReadyTimeoutMs(timeoutS: number | undefined): number | undefined {
+	if (timeoutS === undefined) return undefined;
+	if (typeof timeoutS !== "number" || !Number.isFinite(timeoutS) || timeoutS <= 0) {
+		throw new Error("Invalid ready_timeout_s: must be a finite positive number of seconds");
+	}
+	const ms = Math.ceil(timeoutS * 1000);
+	if (ms > MAX_TIMER_MS) throw new Error(`Invalid ready_timeout_s: maximum is ${MAX_TIMER_MS / 1000} seconds`);
+	return ms;
+}
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
 	description: Type.Optional(
@@ -195,6 +217,18 @@ const bashSchema = Type.Object({
 		Type.Union([Type.Literal("wake"), Type.Literal("silent")], {
 			description:
 				'Wake policy when the job finishes in the background: "wake" (default) sends a completion notice; "silent" never wakes, check it with bash_job.',
+		}),
+	),
+	ready_pattern: Type.Optional(
+		Type.String({
+			description:
+				"JS regex matched against each new complete output line; on the first match you get one early ready notice while the job keeps running. Use with run_in_background for servers.",
+		}),
+	),
+	ready_timeout_s: Type.Optional(
+		Type.Number({
+			description:
+				"Seconds to watch for ready_pattern before the watch expires silently; the job keeps running either way.",
 		}),
 	),
 });
@@ -285,6 +319,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	let ctxRef: ExtensionContext | undefined;
 	let disposed = false;
 	let pending: Job[] = [];
+	/** Jobs whose readiness watch fired and whose early notice has not been delivered or dropped. */
+	let readyPending: Job[] = [];
 	let flushTimer: NodeJS.Timeout | undefined;
 	/** The last run was aborted by the user; until a new run starts, completions are recorded without starting a turn. */
 	let lastRunAborted = false;
@@ -308,6 +344,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		if (flushTimer) clearTimeout(flushTimer);
 		flushTimer = undefined;
 		pending = [];
+		readyPending = [];
 		manager?.dispose();
 		manager = undefined;
 		managerSessionId = undefined;
@@ -361,6 +398,17 @@ export default function asyncBash(pi: ExtensionAPI): void {
 					pending.push(job);
 					scheduleIdleFlush(IDLE_FLUSH_DELAY_MS);
 				},
+				onReady: (job) => {
+					// Generation guard, same as completion delivery.
+					if (disposed || managerSessionId !== owner.sessionId) return;
+					// Silent jobs never wake, not even early; they stay visible via bash_job.
+					if (notifyOfJob(job.id) === "silent") {
+						job.readyDelivered = true;
+						return;
+					}
+					readyPending.push(job);
+					scheduleIdleFlush(IDLE_FLUSH_DELAY_MS);
+				},
 				onChange: (job) => {
 					if (disposed || managerSessionId !== owner.sessionId) return;
 					board.changed(job.id);
@@ -394,6 +442,21 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		return jobs;
 	};
 
+	/**
+	 * Take readiness watches that fired and deserve an early notice. A notice goes out only
+	 * while the job is still background-owned and running: a job that finished first is
+	 * reported through its completion notice instead, and a foreground-owned match through
+	 * the foreground/handoff result. Everything dequeued is marked so it never wakes twice.
+	 */
+	const takeReady = (): Job[] => {
+		const jobs = readyPending.filter(
+			(job) => !job.readyDelivered && job.running && job.owner === "background" && notifyOfJob(job.id) !== "silent",
+		);
+		for (const job of readyPending) job.readyDelivered = true;
+		readyPending = [];
+		return jobs;
+	};
+
 	const formatCompletion = (job: Job, tailBytes: number, tailLines: number): string => {
 		const info = job.info();
 		const elapsed = (info.endedAt ?? Date.now()) - info.startedAt;
@@ -407,6 +470,41 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			lines.push(tail.text ? `Last output${tail.truncated ? " (truncated, read the log for more)" : ""}:\n${tail.text}` : "No output.");
 		}
 		return lines.join("\n");
+	};
+
+	const formatReady = (job: Job, tailBytes: number, tailLines: number): string => {
+		const info = job.info();
+		const elapsed = Date.now() - info.startedAt;
+		const lines = [
+			`Background job ${info.id} is ready: an output line matched ${JSON.stringify(job.readySource ?? "")}.`,
+			`Command: ${oneLine(info.command)}`,
+			job.readyLine !== undefined ? `Matched line: ${oneLine(job.readyLine)}` : undefined,
+			`Full output log: ${info.logPath}`,
+			`It keeps running after ${seconds(elapsed)}. You will be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`,
+		];
+		if (manager && tailLines > 0) {
+			const tail = manager.tail(job, tailBytes, tailLines);
+			lines.push(tail.text ? `Last output${tail.truncated ? " (truncated, read the log for more)" : ""}:\n${tail.text}` : "No output.");
+		}
+		return lines.join("\n");
+	};
+
+	const buildReadyNotice = (jobs: Job[]) => {
+		const header = jobs.length === 1 ? "[bash job ready]" : `[${jobs.length} bash jobs ready]`;
+		const parts = jobs.map((job) => formatReady(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES));
+		// Display-only copy of each job's tail for the transcript renderer; the model reads `content`.
+		const details: { jobs: CompletedJob[] } = {
+			jobs: jobs.map((job) => {
+				const tail = manager && !job.logDeleted ? manager.tail(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES).text : "";
+				return { ...job.info(), outputTail: tail };
+			}),
+		};
+		return {
+			customType: NOTIFY_CUSTOM_TYPE,
+			content: `${header}\n${parts.join("\n\n")}`,
+			display: true,
+			details,
+		};
 	};
 
 	const buildNotice = (jobs: Job[]) => {
@@ -449,8 +547,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		flushTimer = setTimeout(() => {
 			flushTimer = undefined;
 			const ctx = ctxRef;
-			if (!managerFor(ctx) || pending.every((job) => job.delivered)) {
+			if (!managerFor(ctx) || (pending.every((job) => job.delivered) && readyPending.every((job) => job.readyDelivered))) {
 				pending = [];
+				readyPending = [];
 				return;
 			}
 			let idle = false;
@@ -463,6 +562,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				scheduleIdleFlush(IDLE_RETRY_MS);
 				return;
 			}
+			const readies = takeReady();
+			if (readies.length > 0) safeSend(buildReadyNotice(readies), !lastRunAborted);
 			const jobs = takePending();
 			if (jobs.length > 0) safeSend(buildNotice(jobs), !lastRunAborted);
 		}, delay);
@@ -471,11 +572,13 @@ export default function asyncBash(pi: ExtensionAPI): void {
 
 	const boundaryDelivery = (outcome: string, ctx: ExtensionContext) => {
 		if (!managerFor(ctx) || outcome !== "completed") return undefined;
+		const readies = takeReady();
 		const jobs = takePending();
-		if (jobs.length === 0) return undefined;
-		const notice = buildNotice(jobs);
-		const draft: SessionBoundaryDraft = { type: "custom_message", ...notice };
-		return { entries: [draft], continue: true };
+		if (readies.length === 0 && jobs.length === 0) return undefined;
+		const entries: SessionBoundaryDraft[] = [];
+		if (readies.length > 0) entries.push({ type: "custom_message", ...buildReadyNotice(readies) });
+		if (jobs.length > 0) entries.push({ type: "custom_message", ...buildNotice(jobs) });
+		return { entries, continue: true };
 	};
 
 	const finishHeadlessTurn = async (outcome: string, ctx: ExtensionContext) => {
@@ -515,6 +618,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		ctxRef = ctx;
 		lastRunAborted = event.aborted;
 		if (!managerFor(ctx)) return;
+		const readies = takeReady();
+		if (readies.length > 0) safeSend(buildReadyNotice(readies), !lastRunAborted);
 		const jobs = takePending();
 		// After an abort, record the notice without starting a model turn on the user's behalf.
 		if (jobs.length > 0) safeSend(buildNotice(jobs), !lastRunAborted);
@@ -579,6 +684,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 					: `Command started in the background as job ${info.id}. It has NOT completed.`,
 			`Full output log: ${info.logPath}`,
 			info.timeoutMs ? `It will be killed if still running ${info.timeoutMs / 1000} seconds after launch.` : undefined,
+			job.readySource
+				? `It watches output for the pattern ${JSON.stringify(job.readySource)} and will notify you once when an output line matches.`
+				: undefined,
 			silent
 				? `It is silent: you will NOT be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`
 				: `You will be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`,
@@ -610,6 +718,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	const foregroundResult = (job: Job): AgentToolResult<BashDetails> => {
 		const mgr = manager;
 		const info = job.info();
+		// A foreground completion shows its output directly, so no readiness wake is ever owed.
+		job.readyDelivered = true;
+		readyPending = readyPending.filter((j) => j !== job);
 		const tail = mgr ? mgr.tail(job, MODEL_TAIL_BYTES, MODEL_TAIL_LINES) : { text: "", truncated: false, totalBytes: 0 };
 		job.delivered = true;
 		// A truncated result points at the log, so the job stays registered and its log stays in the disk budget.
@@ -654,12 +765,13 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		description:
 			"Execute a bash command in the current working directory. Returns stdout and stderr (last 2000 lines or 50KB; the full log path is given when truncated). " +
 			"A command still running after a short foreground wait keeps running as a background job: the result then reports it as running, with a job ID and log path, and you are notified when it finishes. " +
-			"Set run_in_background to start it in the background immediately. Optionally provide a timeout in seconds: a hard deadline that also applies in the background. Manage jobs with bash_job.",
+			"Set run_in_background to start it in the background immediately. Optionally provide a timeout in seconds: a hard deadline that also applies in the background. Pass ready_pattern (a JS regex) to be woken early when an output line matches; the job keeps running. Manage jobs with bash_job.",
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.); long commands continue as background jobs",
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
 			"bash waits briefly for a command (about 10 s by default); if it is still running, the result says it moved to the background as a job. That job has NOT completed: wait for the completion notice (or bash_job wait) before relying on its outcome.",
 			"Use run_in_background for servers, watchers, and long builds instead of shell `&`; stop jobs you no longer need with bash_job stop.",
+			"For servers, pass ready_pattern (a JS regex) with run_in_background: you get one early ready notice when an output line matches, while the job keeps running.",
 			"In headless runs, pending background jobs are joined before the process exits. Stop servers and watchers you no longer need before finishing your task.",
 		],
 		parameters: bashSchema,
@@ -669,6 +781,11 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			ctxRef = ctx;
 			const timeoutMs = resolveTimeoutMs(params.timeout);
 			const notify = resolveNotify(params.notify);
+			const readyPattern = resolveReadyPattern(params.ready_pattern);
+			const readyTimeoutMs = resolveReadyTimeoutMs(params.ready_timeout_s);
+			if (readyTimeoutMs !== undefined && readyPattern === undefined) {
+				throw new Error("Invalid ready_timeout_s: requires ready_pattern");
+			}
 			if (signal?.aborted) throw new Error("Command aborted");
 			const mgr = ensureManager(ctx);
 			const prefix = pi.getSettings().shellCommandPrefix;
@@ -680,6 +797,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				env: buildEnv(ctx),
 				timeoutMs,
 				background: params.run_in_background === true,
+				readyPattern,
+				readyTimeoutMs,
 			});
 			notifyPolicy.set(job.id, notify);
 
@@ -782,10 +901,12 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				// a stop on a settled job returns its recorded outcome, never synthesizes `stopped`.
 				if (job.running) {
 					job.delivered = true;
+					job.readyDelivered = true;
 					void mgr.requestStop(job, "stopped");
 					await mgr.wait(job, STOP_WAIT_MS, signal);
 				}
 				job.delivered = true;
+				job.readyDelivered = true;
 				const notify = notifyOfJob(job.id);
 				const text = job.running
 					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath} Notify: ${notify}.`

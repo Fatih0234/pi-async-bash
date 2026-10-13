@@ -27,7 +27,15 @@ describe("registration and config", () => {
 		assert.deepEqual([...rt.tools.keys()].sort(), ["bash", "bash_job"]);
 		for (const name of ["exec", "wait", "exec_command", "write_stdin", "apply_patch"]) assert.equal(rt.tools.has(name), false);
 		const params = (rt.tools.get("bash") as any).parameters;
-		assert.deepEqual(Object.keys(params.properties).sort(), ["command", "description", "notify", "run_in_background", "timeout"]);
+		assert.deepEqual(Object.keys(params.properties).sort(), [
+			"command",
+			"description",
+			"notify",
+			"ready_pattern",
+			"ready_timeout_s",
+			"run_in_background",
+			"timeout",
+		]);
 		assert.deepEqual(params.required, ["command"]);
 	});
 
@@ -501,3 +509,87 @@ describe("notify policy", () => {
 	});
 });
 
+
+describe("readiness watch", () => {
+	test("a matching line wakes once while the job keeps running", async () => {
+		const rt = runtime("ready-1");
+		const result = await rt.bash({
+			command: "echo boot; sleep 0.6; echo ready on :5173; sleep 30",
+			run_in_background: true,
+			ready_pattern: "ready on :\\d+",
+		});
+		assert.equal(result.details.background, true);
+		assert.match(text(result), /watches output for the pattern/);
+		const jobId = result.details.jobId as string;
+		await waitFor(() => noticeOf(rt).length === 1, 5000, "ready notification");
+		await sleep(400);
+		const notices = noticeOf(rt);
+		assert.equal(notices.length, 1, "exactly one ready notice, no completion yet");
+		assert.equal(notices[0]!.options?.triggerTurn, true);
+		assert.match(notices[0]!.message.content, /\[bash job ready\]/);
+		assert.match(notices[0]!.message.content, new RegExp(jobId));
+		assert.match(notices[0]!.message.content, /ready on :5173/);
+		assert.match(notices[0]!.message.content, /keeps running/);
+		const status = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(status), /still running/);
+		const stopped = await rt.job({ action: "stop", job_id: jobId });
+		assert.match(text(stopped), /was stopped/);
+		await sleep(600);
+		assert.equal(noticeOf(rt).length, 1, "stopping after ready sends no second notice");
+	});
+
+	test("busy agent: ready notice arrives through turn_end as its own entry", async () => {
+		const rt = runtime("ready-2");
+		rt.idle = false;
+		await rt.bash({
+			command: "sleep 0.4; echo ready on :5173; sleep 30",
+			run_in_background: true,
+			ready_pattern: "ready on :\\d+",
+		});
+		await sleep(1500);
+		assert.equal(noticeOf(rt).length, 0, "no direct send while busy");
+		const [first] = await rt.emit("turn_end", { outcome: "completed" });
+		assert.equal(first.continue, true);
+		assert.equal(first.entries.length, 1);
+		assert.match(first.entries[0].content, /\[bash job ready\]/);
+		assert.match(first.entries[0].content, /ready on :5173/);
+		const [second] = await rt.emit("turn_end", { outcome: "completed" });
+		assert.equal(second, undefined, "ready notice is delivered once");
+		await rt.job({ action: "stop", job_id: (await rt.job({ action: "list" })).details.jobs[0].id });
+	});
+
+	test("silent jobs never send a ready notice", async () => {
+		const rt = runtime("ready-3");
+		const result = await rt.bash({
+			command: "echo ready on :5173; sleep 30",
+			run_in_background: true,
+			notify: "silent",
+			ready_pattern: "ready on :\\d+",
+		});
+		const jobId = result.details.jobId as string;
+		await sleep(1500);
+		assert.strictEqual(noticeOf(rt).length, 0);
+		assert.deepEqual(await rt.emit("turn_end", { outcome: "completed" }), [undefined]);
+		const status = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(status), /still running/);
+		await rt.job({ action: "stop", job_id: jobId });
+		await sleep(600);
+		assert.strictEqual(noticeOf(rt).length, 0);
+	});
+
+	test("invalid ready_pattern is a pre-spawn tool error and starts no job", async () => {
+		const rt = runtime("ready-4");
+		await assert.rejects(rt.bash({ command: "echo hi", ready_pattern: "ready (:" }), /Invalid ready_pattern.*ready \(\:/);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+
+	test("invalid ready_timeout_s is rejected", async () => {
+		const rt = runtime("ready-5");
+		await assert.rejects(rt.bash({ command: "true", ready_pattern: "x", ready_timeout_s: 0 }), /Invalid ready_timeout_s/);
+		await assert.rejects(
+			rt.bash({ command: "true", ready_timeout_s: 5 }),
+			/Invalid ready_timeout_s: requires ready_pattern/,
+		);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+});

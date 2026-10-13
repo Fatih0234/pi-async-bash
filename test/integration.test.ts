@@ -16,8 +16,9 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { tempDir, waitFor } from "./helpers.ts";
+import { alive, sleep, tempDir, waitFor } from "./helpers.ts";
 import { piRoot } from "./ui-helpers.ts";
+import { JobManager } from "../src/manager.ts";
 
 const EXTENSION = resolve(import.meta.dirname, "../src/index.ts");
 
@@ -191,5 +192,56 @@ describe("Pi integration (faux provider)", () => {
 		guardPi.setActiveTools(before);
 		assert.ok(session.getActiveToolNames().includes("bash"));
 		assert.equal(guardPi.getAllTools().find((t) => t.name === "bash")?.sourceInfo?.path, EXTENSION);
+	});
+});
+
+describe("readiness watch (live subprocess)", () => {
+	test("a readiness match wakes once while the job keeps running; stop kills the tree", async () => {
+		const readies: { id: string; line: string | undefined }[] = [];
+		const mgr = new JobManager({
+			logDir: join(tempDir(), "logs"),
+			shell: "/bin/bash",
+			shellArgs: ["-c"],
+			killGraceMs: 300,
+			monitorIntervalMs: 25,
+			onReady: (job) => readies.push({ id: job.id, line: job.readyLine }),
+		});
+		try {
+			const job = mgr.start({
+				command: "echo boot; sleep 0.5; echo ready on :5173; sleep 30 & echo $!; wait",
+				cwd: "/",
+				background: true,
+				readyPattern: "ready on :\\d+",
+			});
+			assert.equal(await job.launched, true);
+			await waitFor(() => readies.length === 1, 5000, "readiness match");
+			assert.equal(job.running, true, "the job keeps running after the ready match");
+			assert.equal(readies[0]!.id, job.id);
+			assert.equal(readies[0]!.line, "ready on :5173");
+			// Re-scanning (explicitly or on later ticks with no new bytes) never refires.
+			assert.equal(mgr.checkReady(job), true);
+			await sleep(200);
+			assert.equal(readies.length, 1);
+			assert.equal(job.readyFired, true);
+			await waitFor(() => /^\d+$/m.test(mgr.tail(job, 100, 5).text), 3000, "descendant pid");
+			const pid = Number(mgr.tail(job, 100, 5).text.match(/^\d+$/m)![0]);
+			assert.ok(alive(pid));
+			const info = await mgr.requestStop(job, "stopped");
+			assert.equal(info.status, "stopped");
+			await waitFor(() => !alive(pid), 3000, "descendant to die");
+			assert.equal(readies.length, 1, "stop sends no second ready notice");
+		} finally {
+			mgr.dispose();
+		}
+	});
+
+	test("an invalid ready pattern is a pre-spawn error: no process, no log, no job", async () => {
+		const mgr = new JobManager({ logDir: join(tempDir(), "logs"), shell: "/bin/bash", shellArgs: ["-c"] });
+		try {
+			assert.throws(() => mgr.start({ command: "echo hi", cwd: "/", readyPattern: "ready (:" }), /Invalid ready_pattern.*ready \(\:/);
+			assert.equal(mgr.list().length, 0);
+		} finally {
+			mgr.dispose();
+		}
 	});
 });

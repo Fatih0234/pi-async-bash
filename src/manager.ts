@@ -19,6 +19,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import { constants as osConstants } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 export const MAX_TIMER_MS = 2_147_483_647;
 
@@ -51,6 +52,13 @@ export interface JobSpec {
 	timeoutMs?: number;
 	/** Start owned by the background (explicit `run_in_background`). */
 	background?: boolean;
+	/**
+	 * Readiness watch: JS regex source matched against each new complete output line.
+	 * On the first match the manager fires `onReady` once; the job keeps running.
+	 */
+	readyPattern?: string;
+	/** How long after launch the readiness watch stays armed. The job keeps running after expiry. */
+	readyTimeoutMs?: number;
 }
 
 export interface JobInfo {
@@ -98,6 +106,8 @@ export interface JobManagerOptions {
 	unref?: boolean;
 	/** Called once when a background-owned job finishes and its result was not yet delivered. */
 	onBackgroundComplete?: (job: Job) => void;
+	/** Called at most once per job, when a new output line first matches its readiness watch. */
+	onReady?: (job: Job) => void;
 	/** Observer for display state: launch, handoff, stop request, finish. Never affects ownership. */
 	onChange?: (job: Job, change: JobChange) => void;
 	now?: () => number;
@@ -134,6 +144,21 @@ export class Job {
 	/** @internal */ cleanupTimer: NodeJS.Timeout | undefined;
 	/** @internal */ child: ChildProcess | undefined;
 	/** @internal */ deadlineTimer: NodeJS.Timeout | undefined;
+	/** Raw `ready_pattern` source arming this job's readiness watch, if any. */
+	readonly readySource: string | undefined;
+	/** The completed output line that first matched the readiness watch. Set once, when it fires. */
+	readyLine: string | undefined;
+	/** The readiness watch fired (at most once per job). */
+	readyFired = false;
+	/** The readiness watch expired (`readyTimeoutMs`) without a match. */
+	readyExpired = false;
+	/** The model received this job's readiness notice (or it was dropped as stale). */
+	readyDelivered = false;
+	/** @internal */ readyRegex: RegExp | undefined;
+	/** @internal */ readyMatcher: ReadyLineMatcher | undefined;
+	/** @internal */ readyDecoder: StringDecoder | undefined;
+	/** @internal */ readyScannedBytes = 0;
+	/** @internal */ readyTimer: NodeJS.Timeout | undefined;
 	/** @internal */ resolveDone!: (info: JobInfo) => void;
 	/** @internal */ resolveLaunched!: (ok: boolean) => void;
 
@@ -145,6 +170,7 @@ export class Job {
 		this.logPath = logPath;
 		this.startedAt = startedAt;
 		this.timeoutMs = spec.timeoutMs;
+		this.readySource = spec.readyPattern;
 		this.owner = spec.background ? "background" : "foreground";
 		this.done = new Promise((resolve) => {
 			this.resolveDone = resolve;
@@ -185,6 +211,76 @@ export function validateTimeoutMs(timeoutMs: number | undefined): void {
 	if (timeoutMs === undefined) return;
 	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Invalid timeout: must be a finite positive number");
 	if (timeoutMs > MAX_TIMER_MS) throw new Error(`Invalid timeout: maximum is ${MAX_TIMER_MS / 1000} seconds`);
+}
+
+/** Compile a readiness-watch pattern. Throws before spawn, with the pattern echoed back. */
+export function compileReadyPattern(source: string): RegExp {
+	if (typeof source !== "string" || source === "") {
+		throw new Error(`Invalid ready_pattern ${JSON.stringify(source)}: must be a non-empty JS regex source`);
+	}
+	try {
+		return new RegExp(source);
+	} catch (err) {
+		throw new Error(`Invalid ready_pattern ${JSON.stringify(source)}: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+export function validateReadyTimeoutMs(readyTimeoutMs: number | undefined): void {
+	if (readyTimeoutMs === undefined) return;
+	if (!Number.isFinite(readyTimeoutMs) || readyTimeoutMs <= 0) {
+		throw new Error("Invalid readyTimeoutMs: must be a finite positive number");
+	}
+	if (readyTimeoutMs > MAX_TIMER_MS) throw new Error(`Invalid readyTimeoutMs: maximum is ${MAX_TIMER_MS / 1000} seconds`);
+}
+
+/** Per monitor tick, at most this many new log bytes are scanned for a readiness match. */
+const READY_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Incremental per-line matcher for a readiness watch. Feed only new output text: each complete
+ * line is evaluated against the pattern exactly once, in order. Fires at most once ever: after
+ * the first match every later `push` returns []. A trailing partial line is held until it
+ * completes. Lines are matched raw (only a trailing carriage return is stripped).
+ */
+export class ReadyLineMatcher {
+	private readonly pattern: RegExp;
+	private buffer = "";
+	private nextIndex = 0;
+	private done = false;
+	/** The completed line that matched, once fired. */
+	matchedLine: string | undefined;
+
+	constructor(pattern: RegExp) {
+		this.pattern = pattern;
+	}
+
+	get fired(): boolean {
+		return this.done;
+	}
+
+	/**
+	 * Feed new output text. Returns the indices of newly completed lines that match
+	 * (at most one entry, and empty on every call after the first match).
+	 */
+	push(chunk: string): number[] {
+		if (this.done || chunk === "") return [];
+		this.buffer += chunk;
+		let nl: number;
+		while ((nl = this.buffer.indexOf("\n")) >= 0) {
+			let line = this.buffer.slice(0, nl);
+			this.buffer = this.buffer.slice(nl + 1);
+			if (line.endsWith("\r")) line = line.slice(0, -1);
+			const index = this.nextIndex++;
+			if (this.pattern.test(line)) {
+				this.done = true;
+				this.matchedLine = line;
+				// The watch is over; buffered text (complete or partial) is never scanned.
+				this.buffer = "";
+				return [index];
+			}
+		}
+		return [];
+	}
 }
 
 function signalExitCode(signal: NodeJS.Signals | null): number {
@@ -344,8 +440,8 @@ export function pruneSessionLogDirs(base: string, maxAgeMs: number, keep: string
 
 export class JobManager {
 	readonly logDir: string;
-	private readonly opts: Required<Omit<JobManagerOptions, "onBackgroundComplete" | "commandOnStdin" | "onChange">> &
-		Pick<JobManagerOptions, "onBackgroundComplete" | "commandOnStdin" | "onChange">;
+	private readonly opts: Required<Omit<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange">> &
+		Pick<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange">;
 	private readonly jobs = new Map<string, Job>();
 	/** Cleanup must outlive result release and completed-job retention eviction. */
 	private readonly pendingGroupCleanup = new Set<Job>();
@@ -393,6 +489,14 @@ export class JobManager {
 	start(spec: JobSpec): Job {
 		if (this.disposed) throw new Error("The shell job manager for this session has shut down.");
 		validateTimeoutMs(spec.timeoutMs);
+		// The readiness pattern is compiled before any side effect: an invalid regex is a
+		// pre-spawn error and no process, log, or job is created for the call.
+		let readyRegex: RegExp | undefined;
+		if (spec.readyPattern !== undefined) readyRegex = compileReadyPattern(spec.readyPattern);
+		validateReadyTimeoutMs(spec.readyTimeoutMs);
+		if (spec.readyTimeoutMs !== undefined && spec.readyPattern === undefined) {
+			throw new Error("Invalid readyTimeoutMs: requires readyPattern");
+		}
 		if (this.runningCount() >= this.opts.maxRunning) {
 			throw new Error(
 				`Too many running shell jobs (limit ${this.opts.maxRunning}). Stop or wait for one with bash_job first.`,
@@ -453,6 +557,19 @@ export class JobManager {
 		if (spec.timeoutMs !== undefined) {
 			job.deadlineTimer = setTimeout(() => this.requestStop(job, "timed_out"), spec.timeoutMs);
 			if (this.opts.unref) job.deadlineTimer.unref();
+		}
+		if (readyRegex) {
+			job.readyRegex = readyRegex;
+			job.readyMatcher = new ReadyLineMatcher(readyRegex);
+			job.readyDecoder = new StringDecoder("utf8");
+			if (spec.readyTimeoutMs !== undefined) {
+				// Expiry only disarms the watch; the job keeps running and still reports completion.
+				job.readyTimer = setTimeout(() => {
+					job.readyExpired = true;
+					job.readyMatcher = undefined;
+				}, spec.readyTimeoutMs);
+				if (this.opts.unref) job.readyTimer.unref();
+			}
 		}
 		this.ensureMonitor();
 		this.notifyChange(job, "start");
@@ -602,6 +719,9 @@ export class JobManager {
 		job.error = error;
 		if (job.deadlineTimer) clearTimeout(job.deadlineTimer);
 		job.deadlineTimer = undefined;
+		// The job is done; the readiness watch is over (a match now would be stale next to completion).
+		if (job.readyTimer) clearTimeout(job.readyTimer);
+		job.readyTimer = undefined;
 		job.child = undefined;
 		try {
 			job.logBytes = fs.statSync(job.logPath).size;
@@ -707,9 +827,76 @@ export class JobManager {
 		if (largest) void this.requestStop(largest.job, "output_limit");
 	}
 
+	/**
+	 * Scan log bytes written since the last scan for the job's readiness pattern.
+	 * Old bytes are never re-scanned: the scan offset only advances over bytes read.
+	 * Fires at most once per job through `onReady`; the job keeps running.
+	 * Exposed for tests; the monitor tick calls it for every running watched job.
+	 */
+	checkReady(job: Job): boolean {
+		if (!job.readyRegex || !job.readyMatcher || !job.readyDecoder) return job.readyFired;
+		if (job.readyFired || job.readyExpired || !job.running) return job.readyFired;
+		let size: number;
+		try {
+			size = fs.statSync(job.logPath).size;
+		} catch {
+			return false;
+		}
+		// The log only grows while the job runs; a smaller file means it was rewritten
+		// under us, so continue from its start rather than skipping everything.
+		if (size < job.readyScannedBytes) job.readyScannedBytes = size;
+		if (size <= job.readyScannedBytes) return false;
+		const length = Math.min(size - job.readyScannedBytes, READY_SCAN_MAX_BYTES);
+		let fd: number;
+		try {
+			fd = fs.openSync(job.logPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		} catch {
+			return false;
+		}
+		try {
+			const buf = Buffer.alloc(length);
+			let read = 0;
+			while (read < length) {
+				const n = fs.readSync(fd, buf, read, length - read, job.readyScannedBytes + read);
+				if (n <= 0) break;
+				read += n;
+			}
+			job.readyScannedBytes += read;
+			if (read === 0) return false;
+			// The decoder holds a split trailing character; the matcher holds a split trailing line.
+			const text = job.readyDecoder.write(buf.subarray(0, read));
+			if (job.readyMatcher.push(text).length === 0) return false;
+			job.readyFired = true;
+			job.readyLine = job.readyMatcher.matchedLine;
+			if (job.readyTimer) clearTimeout(job.readyTimer);
+			job.readyTimer = undefined;
+			if (!this.disposed) {
+				try {
+					this.opts.onReady?.(job);
+				} catch {}
+			}
+			return true;
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
+	/** Scan every running watched job for a readiness match. Called on each monitor tick. */
+	private checkReadyJobs(): void {
+		for (const job of this.jobs.values()) {
+			if (!job.running || job.readyFired || job.readyExpired || !job.readyRegex) continue;
+			try {
+				this.checkReady(job);
+			} catch {}
+		}
+	}
+
 	private ensureMonitor(): void {
 		if (this.monitor) return;
-		this.monitor = setInterval(() => this.checkOutputLimits(), this.opts.monitorIntervalMs);
+		this.monitor = setInterval(() => {
+			this.checkOutputLimits();
+			this.checkReadyJobs();
+		}, this.opts.monitorIntervalMs);
 		this.monitor.unref();
 	}
 
