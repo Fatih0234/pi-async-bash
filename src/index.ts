@@ -1,7 +1,7 @@
 /**
  * pi-async-bash: replaces Pi's `bash` tool with one whose processes are owned by a session job
  * manager. A command returns when it finishes, or is handed off to the background after a short
- * user-configured foreground budget (default 2 s). Background completion is delivered to the model
+ * user-configured foreground budget (default 10 s). Background completion is delivered to the model
  * once, through session boundaries or a triggered turn. `bash_job` lists, waits for, and stops jobs.
  */
 import { statSync } from "node:fs";
@@ -50,7 +50,7 @@ const WAIT_DEFAULT_SECONDS = 30;
 const WAIT_MAX_SECONDS = 600;
 const STOP_WAIT_MS = 5000;
 const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const DEFAULT_FOREGROUND_MS = 2000;
+const DEFAULT_FOREGROUND_MS = 10000;
 
 export interface AsyncBashConfig {
 	/** Automatic handoff budget in ms; null waits for completion (explicit background still works). */
@@ -79,17 +79,61 @@ export function parseForegroundMs(raw: string | undefined): number | null | unde
 	return n;
 }
 
+/** Read the `asyncBash.foregroundMs` Pi setting: integer ms, numeric string, or `"off"`. */
+function parseSettingsForegroundMs(settings: unknown): number | null | undefined {
+	const holder = (settings as { asyncBash?: unknown } | null | undefined)?.asyncBash;
+	const raw = (holder as { foregroundMs?: unknown } | null | undefined)?.foregroundMs;
+	if (raw === undefined || raw === null) return undefined;
+	if (typeof raw === "number") {
+		if (!Number.isInteger(raw) || raw < 0 || raw > MAX_TIMER_MS) {
+			throw new Error(`asyncBash.foregroundMs must be an integer number of milliseconds or "off", got ${JSON.stringify(raw)}`);
+		}
+		return raw === 0 ? null : raw;
+	}
+	if (typeof raw === "string") {
+		try {
+			return parseForegroundMs(raw);
+		} catch {
+			throw new Error(`asyncBash.foregroundMs must be an integer number of milliseconds or "off", got ${JSON.stringify(raw)}`);
+		}
+	}
+	throw new Error(`asyncBash.foregroundMs must be an integer number of milliseconds or "off", got ${JSON.stringify(raw)}`);
+}
+
 /**
- * Resolve user configuration. Precedence: `--bash-foreground-ms` flag, then
- * `PI_ASYNC_BASH_FOREGROUND_MS`, then the mode default (2000 ms; off in one-shot print/json mode,
- * where Pi exits after the run and would kill handed-off jobs).
+ * Resolve the automatic handoff budget in ms (null waits for completion). Precedence:
+ * `--bash-foreground-ms` flag, then `PI_ASYNC_BASH_FOREGROUND_MS`, then the `asyncBash.foregroundMs`
+ * Pi setting, then the mode default (10000 ms; off in one-shot print/json mode, where Pi exits
+ * after the run and would kill handed-off jobs).
  */
-export function resolveConfig(flag: string | undefined, mode: ExtensionMode | undefined, env = process.env): AsyncBashConfig {
+export function resolveForegroundMs(
+	opts: { flag?: string | undefined; mode?: ExtensionMode | undefined; env?: NodeJS.ProcessEnv; settings?: unknown } = {},
+): number | null {
+	const { flag, mode, env = process.env, settings } = opts;
 	// null ("off") is a deliberate value, so only undefined falls through to the next source.
 	const fromFlag = parseForegroundMs(flag);
-	const fromUser = fromFlag !== undefined ? fromFlag : parseForegroundMs(env.PI_ASYNC_BASH_FOREGROUND_MS);
+	if (fromFlag !== undefined) return fromFlag;
+	const fromEnv = parseForegroundMs(env.PI_ASYNC_BASH_FOREGROUND_MS);
+	if (fromEnv !== undefined) return fromEnv;
+	const fromSettings = parseSettingsForegroundMs(settings);
+	if (fromSettings !== undefined) return fromSettings;
 	const oneShot = mode === "print" || mode === "json";
-	const foregroundMs = fromUser !== undefined ? fromUser : oneShot ? null : DEFAULT_FOREGROUND_MS;
+	return oneShot ? null : DEFAULT_FOREGROUND_MS;
+}
+
+/**
+ * Resolve user configuration. Precedence: `--bash-foreground-ms` flag, then
+ * `PI_ASYNC_BASH_FOREGROUND_MS`, then the `asyncBash.foregroundMs` Pi setting, then the mode
+ * default (10000 ms; off in one-shot print/json mode, where Pi exits after the run and would
+ * kill handed-off jobs).
+ */
+export function resolveConfig(
+	flag: string | undefined,
+	mode: ExtensionMode | undefined,
+	env = process.env,
+	settings?: unknown,
+): AsyncBashConfig {
+	const foregroundMs = resolveForegroundMs({ flag, mode, env, settings });
 	const uid = typeof process.getuid === "function" ? process.getuid() : "user";
 	const mb = (name: string) => {
 		const v = parseIntEnv(name, env);
@@ -216,7 +260,7 @@ function errorForStatus(info: JobInfo): string | undefined {
 
 export default function asyncBash(pi: ExtensionAPI): void {
 	pi.registerFlag("bash-foreground-ms", {
-		description: 'pi-async-bash: ms a bash call waits before moving to the background ("off" to wait for completion)',
+		description: 'pi-async-bash: ms a bash call waits before moving to the background (default 10000; "off" to wait for completion)',
 		type: "string",
 	});
 
@@ -237,7 +281,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	const getConfig = (ctx?: ExtensionContext): AsyncBashConfig => {
 		if (!config) {
 			const flag = pi.getFlag("bash-foreground-ms");
-			config = resolveConfig(typeof flag === "string" ? flag : undefined, ctx?.mode ?? ctxRef?.mode);
+			config = resolveConfig(typeof flag === "string" ? flag : undefined, ctx?.mode ?? ctxRef?.mode, process.env, pi.getSettings());
 		}
 		return config;
 	};
@@ -586,7 +630,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.); long commands continue as background jobs",
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
-			"bash waits briefly for a command (about 2 s by default); if it is still running, the result says it moved to the background as a job. That job has NOT completed: wait for the completion notice (or bash_job wait) before relying on its outcome.",
+			"bash waits briefly for a command (about 10 s by default); if it is still running, the result says it moved to the background as a job. That job has NOT completed: wait for the completion notice (or bash_job wait) before relying on its outcome.",
 			"Use run_in_background for servers, watchers, and long builds instead of shell `&`; stop jobs you no longer need with bash_job stop.",
 			"In headless runs, pending background jobs are joined before the process exits. Stop servers and watchers you no longer need before finishing your task.",
 		],

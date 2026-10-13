@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { dirname, join } from "node:path";
 import { after, describe, test } from "node:test";
-import { NOTIFY_CUSTOM_TYPE, parseForegroundMs, resolveConfig, resolveTimeoutMs } from "../src/index.ts";
+import { NOTIFY_CUSTOM_TYPE, parseForegroundMs, resolveConfig, resolveForegroundMs, resolveTimeoutMs } from "../src/index.ts";
 import { FakeRuntime, text } from "./fake-pi.ts";
 import { alive, sleep, tempDir, waitFor } from "./helpers.ts";
 
@@ -42,11 +42,39 @@ describe("registration and config", () => {
 		assert.equal(parseForegroundMs("0"), null);
 		assert.equal(parseForegroundMs("1500"), 1500);
 		assert.throws(() => parseForegroundMs("2s"));
-		assert.equal(resolveConfig(undefined, "tui", {}).foregroundMs, 2000);
-		assert.equal(resolveConfig(undefined, "rpc", {}).foregroundMs, 2000);
+		assert.equal(resolveConfig(undefined, "tui", {}).foregroundMs, 10000);
+		assert.equal(resolveConfig(undefined, "rpc", {}).foregroundMs, 10000);
 		assert.equal(resolveConfig(undefined, "print", {}).foregroundMs, null);
 		assert.equal(resolveConfig(undefined, "json", { PI_ASYNC_BASH_FOREGROUND_MS: "700" }).foregroundMs, 700);
 		assert.equal(resolveConfig("900", "tui", { PI_ASYNC_BASH_FOREGROUND_MS: "700" }).foregroundMs, 900);
+	});
+
+	test("default foreground wait is 10 s with flag > env > settings precedence", () => {
+		// default (no flag, no env, non-headless) resolves to 10000, not 2000
+		assert.strictEqual(resolveForegroundMs({ mode: "tui", env: {}, flag: undefined }), 10000);
+		assert.strictEqual(resolveConfig(undefined, "tui", {}).foregroundMs, 10000);
+		// settings key sits between env and the default
+		assert.strictEqual(resolveConfig(undefined, "tui", {}, { asyncBash: { foregroundMs: 5000 } }).foregroundMs, 5000);
+		assert.strictEqual(resolveConfig(undefined, "rpc", {}, { asyncBash: { foregroundMs: "4000" } }).foregroundMs, 4000);
+		assert.strictEqual(resolveConfig(undefined, "tui", {}, { asyncBash: { foregroundMs: "off" } }).foregroundMs, null);
+		assert.strictEqual(resolveConfig(undefined, "tui", {}, { asyncBash: { foregroundMs: 0 } }).foregroundMs, null);
+		// env beats settings, flag beats both
+		assert.strictEqual(
+			resolveConfig(undefined, "tui", { PI_ASYNC_BASH_FOREGROUND_MS: "700" }, { asyncBash: { foregroundMs: 5000 } }).foregroundMs,
+			700,
+		);
+		assert.strictEqual(resolveConfig("900", "tui", {}, { asyncBash: { foregroundMs: 5000 } }).foregroundMs, 900);
+		assert.strictEqual(
+			resolveConfig("900", "tui", { PI_ASYNC_BASH_FOREGROUND_MS: "700" }, { asyncBash: { foregroundMs: 5000 } }).foregroundMs,
+			900,
+		);
+		// an explicit setting overrides the one-shot off default, like env does
+		assert.strictEqual(resolveConfig(undefined, "print", {}, { asyncBash: { foregroundMs: 5000 } }).foregroundMs, 5000);
+		assert.strictEqual(resolveForegroundMs({ mode: "print", env: {}, flag: undefined }), null);
+		// invalid settings values throw
+		assert.throws(() => resolveConfig(undefined, "tui", {}, { asyncBash: { foregroundMs: "2s" } }), /asyncBash\.foregroundMs/);
+		assert.throws(() => resolveConfig(undefined, "tui", {}, { asyncBash: { foregroundMs: -5 } }), /asyncBash\.foregroundMs/);
+		assert.throws(() => resolveConfig(undefined, "tui", {}, { asyncBash: { foregroundMs: true } }), /asyncBash\.foregroundMs/);
 	});
 
 	test("an explicit off keeps precedence over defaults and env", () => {
@@ -64,6 +92,16 @@ describe("registration and config", () => {
 		const result = await rt.bash({ command: "sleep 0.6; echo waited-fully" });
 		assert.equal(result.details.background, undefined);
 		assert.equal(text(result), "waited-fully");
+	});
+
+	test("settings off makes bash wait for completion", async () => {
+		const rt = new FakeRuntime("settings-off");
+		runtimes.push(rt);
+		rt.settings = { asyncBash: { foregroundMs: "off" } };
+		await rt.emit("session_start", { reason: "start" });
+		const result = await rt.bash({ command: "sleep 0.6; echo waited-via-settings" });
+		assert.equal(result.details.background, undefined);
+		assert.equal(text(result), "waited-via-settings");
 	});
 });
 
