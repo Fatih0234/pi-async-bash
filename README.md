@@ -46,6 +46,8 @@ pi --bash-foreground-ms off    # Only background when explicitly requested
 
 Or set `PI_ASYNC_BASH_FOREGROUND_MS`, or the `asyncBash.foregroundMs` Pi setting. Precedence: flag, then env, then setting, then the 10 s default.
 
+For a budget that survives new shells, prefer the `asyncBash.foregroundMs` Pi setting: the flag and the env var only apply to the process that sets them. A fresh shell without any of the three falls back to the 10 s interactive default, or to synchronous waiting (no automatic handoff) in `print`/`json` mode.
+
 Set `PI_ASYNC_BASH_EVENT_LOG=/path/to/events.jsonl` to record every job as
 one JSON object per line:
 `{"event":"started"|"settled","job_id","command","status?","exitCode?","ts"}`.
@@ -57,7 +59,7 @@ parse each as JSON; `started` carries no `status` and no `exitCode`,
 `null` only when the process never started, i.e. `spawn_error`),
 `ts` is epoch milliseconds.
 
-Jobs belong to the session: **quitting, switching sessions, or reloading stops them**. In print/JSON mode, handoff is opt-in with `--bash-foreground-ms 2000`; pending job results are delivered before the run exits. Stop unneeded servers and watchers before finishing. Process cleanup covers the process group, not escaped daemons.
+Jobs belong to the session: **quitting, switching sessions, or reloading stops them**. In print/JSON mode, handoff is opt-in: `--bash-foreground-ms <ms>`, `PI_ASYNC_BASH_FOREGROUND_MS=<ms>`, or the `asyncBash.foregroundMs` setting (e.g. 2000); pending job results are delivered before the run exits. Stop unneeded servers and watchers before finishing. Process cleanup covers the process group, not escaped daemons.
 
 This extension replaces ordinary Pi `bash`, not `!` commands.
 

@@ -221,13 +221,13 @@ const bashSchema = Type.Object({
 	notify: Type.Optional(
 		Type.Union([Type.Literal("wake"), Type.Literal("silent")], {
 			description:
-				'Wake policy when the job finishes in the background: "wake" (default) sends a completion notice; "silent" never wakes, check it with bash_job.',
+				'Wake policy when the job finishes in the background: "wake" (default) sends a completion notice; "silent" sends no completion or ready notice, check it with bash_job.',
 		}),
 	),
 	ready_pattern: Type.Optional(
 		Type.String({
 			description:
-				"JS regex matched against each new complete output line; on the first match you get one early ready notice while the job keeps running. Use with run_in_background for servers.",
+				"JS regex matched against each new complete output line; on the first match you get one early ready notice while the job keeps running (unless the job is silent). Use with run_in_background for servers.",
 		}),
 	),
 	ready_timeout_s: Type.Optional(
@@ -773,14 +773,14 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		label: "bash",
 		description:
 			"Execute a bash command in the current working directory. Returns stdout and stderr (last 2000 lines or 50KB; the full log path is given when truncated). " +
-			"A command still running after a short foreground wait keeps running as a background job: the result then reports it as running, with a job ID and log path, and you are notified when it finishes. " +
-			"Set run_in_background to start it in the background immediately. Optionally provide a timeout in seconds: a hard deadline that also applies in the background. Pass ready_pattern (a JS regex) to be woken early when an output line matches; the job keeps running. Manage jobs with bash_job.",
+			"A command still running after a short foreground wait keeps running as a background job: the result then reports it as running, with a job ID and log path, and you are notified when it finishes (unless the job is silent). " +
+			"Set run_in_background to start it in the background immediately. Optionally provide a timeout in seconds: a hard deadline that also applies in the background. Pass ready_pattern (a JS regex) to be woken early when an output line matches (unless the job is silent); the job keeps running. Manage jobs with bash_job.",
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.); long commands continue as background jobs",
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
-			"bash waits briefly for a command (about 10 s by default); if it is still running, the result says it moved to the background as a job. That job has NOT completed: wait for the completion notice (or bash_job wait) before relying on its outcome.",
+			"bash waits briefly for a command (about 10 s by default); if it is still running, the result says it moved to the background as a job. That job has NOT completed: wait for the completion notice (silent jobs send none; use bash_job wait) before relying on its outcome.",
 			"Use run_in_background for servers, watchers, and long builds instead of shell `&`; stop jobs you no longer need with bash_job stop.",
-			"For servers, pass ready_pattern (a JS regex) with run_in_background: you get one early ready notice when an output line matches, while the job keeps running.",
+			"For servers, pass ready_pattern (a JS regex) with run_in_background: you get one early ready notice when an output line matches (silent jobs send none), while the job keeps running.",
 			"In headless runs, pending background jobs are joined before the process exits. Stop servers and watchers you no longer need before finishing your task.",
 		],
 		parameters: bashSchema,
