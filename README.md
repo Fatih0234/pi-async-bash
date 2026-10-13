@@ -4,7 +4,7 @@
 
 **Long commands. Short waits.**
 
-Claude-style Bash jobs for [Pi](https://pi.dev). Quick commands return normally. After two seconds, long commands move to the background and notify the agent when they finish.
+Claude-style Bash jobs for [Pi](https://pi.dev). Quick commands return normally. After ten seconds, long commands move to the background and notify the agent when they finish.
 
 ![Shell jobs panel with live output and command status](qa/captures/06-jobs-panel.png)
 

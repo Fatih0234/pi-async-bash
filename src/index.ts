@@ -690,7 +690,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 					: `Command started in the background as job ${info.id}. It has NOT completed.`,
 			`Full output log: ${info.logPath}`,
 			info.timeoutMs ? `It will be killed if still running ${info.timeoutMs / 1000} seconds after launch.` : undefined,
-			job.readySource
+			job.readySource && !silent
 				? `It watches output for the pattern ${JSON.stringify(job.readySource)} and will notify you once when an output line matches.`
 				: undefined,
 			silent
