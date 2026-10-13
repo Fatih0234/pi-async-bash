@@ -1,5 +1,7 @@
 # pi-async-bash
 
+> Fork of [isthatyousaf/pi-async-bash](https://github.com/isthatyousaf/pi-async-bash) at commit `373e4e3`. Maintained at [Fatih0234/pi-async-bash](https://github.com/Fatih0234/pi-async-bash).
+
 **Long commands. Short waits.**
 
 Claude-style Bash jobs for [Pi](https://pi.dev). Quick commands return normally. After two seconds, long commands move to the background and notify the agent when they finish.
@@ -11,7 +13,7 @@ Claude-style Bash jobs for [Pi](https://pi.dev). Quick commands return normally.
 ## Install
 
 ```sh
-pi install git:github.com/isthatyousaf/pi-async-bash
+pi install git:github.com/Fatih0234/pi-async-bash
 ```
 
 Restart Pi or run `/reload`. Requires **Pi 1.1.0+**. Tested on Linux.
