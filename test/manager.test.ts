@@ -604,3 +604,49 @@ describe("readiness line matcher", () => {
 		assert.throws(() => compileReadyPattern(""), /Invalid ready_pattern/);
 	});
 });
+
+describe("ready matcher incremental scans (issue #5)", () => {
+	test("(c) long newline-free output costs O(new bytes) per tick, not O(buffer)", () => {
+		const matcher = new ReadyLineMatcher(compileReadyPattern("READY-NEVER"));
+		const chunk = "x".repeat(20_000);
+		matcher.push(chunk);
+		const m = matcher as unknown as { scannedBytes?: unknown; pendingBytes?: unknown; buffer?: unknown };
+		assert.equal(typeof m.scannedBytes, "number", "matcher exposes a scannedBytes seam");
+		const afterFirst = m.scannedBytes as number;
+		assert.ok(
+			afterFirst >= 20_000 && afterFirst < 40_000,
+			`first push scans ~new bytes (got ${afterFirst})`,
+		);
+		matcher.push(chunk);
+		const afterSecond = (matcher as unknown as { scannedBytes: number }).scannedBytes;
+		const secondIncrement = afterSecond - afterFirst;
+		assert.ok(
+			secondIncrement >= 20_000 && secondIncrement < 40_000,
+			`second push scans only the new tail, not the whole buffer (increment ${secondIncrement})`,
+		);
+		const pending =
+			typeof m.pendingBytes === "number" ? (m.pendingBytes as number) : (m.buffer as string).length;
+		assert.ok(pending <= 8192, `undecided tail stays small (got ${pending})`);
+	});
+
+	test("(d) flush-at-finish still delivers unterminated-tail matches after the offset change", () => {
+		const matcher = new ReadyLineMatcher(compileReadyPattern("ready on :\\d+"));
+		assert.deepEqual(matcher.push("boot\nready on :51"), []);
+		assert.deepEqual(matcher.push("73"), [], "split line completes only at flush");
+		assert.deepEqual(matcher.flush(), [1]);
+		assert.equal(matcher.matchedLine, "ready on :5173");
+		// A match at the start of a long unterminated tail still flushes: only the
+		// 4096-char ReDoS prefix is tested, so the prefix match must survive the offsets.
+		const longM = new ReadyLineMatcher(compileReadyPattern("READY-AT-START"));
+		longM.push(`READY-AT-START${"x".repeat(50_000)}`);
+		assert.deepEqual(longM.flush(), [0]);
+		assert.match(longM.matchedLine ?? "", /READY-AT-START/);
+		// A match past the 4096-char cap stays missed, as before the change.
+		const pastCap = new ReadyLineMatcher(compileReadyPattern("READY-TAIL"));
+		pastCap.push(`${"x".repeat(5000)}READY-TAIL`);
+		assert.deepEqual(pastCap.flush(), []);
+		// The scan seam stays O(new bytes) across the split pushes above.
+		const seam = matcher as unknown as { scannedBytes?: unknown };
+		assert.equal(typeof seam.scannedBytes, "number", "flush path keeps the scan seam");
+	});
+});

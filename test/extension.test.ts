@@ -859,3 +859,68 @@ describe("readiness watch", () => {
 		assert.strictEqual(noticeOf(rt).length, 0, "stopping an expired watch sends no notice");
 	});
 });
+
+describe("ready watch across stop (issues #1)", () => {
+	test("(a) stop-survived job keeps an armed watch and a later match still notifies", async () => {
+		const rt = runtime("ready-stop-survived");
+		const result = await rt.bash({
+			command: "trap '' TERM; sleep 0.6; echo READY-SURVIVED-AAA; sleep 30",
+			run_in_background: true,
+			ready_pattern: "READY-SURVIVED-AAA",
+		});
+		const jobId = result.details.jobId as string;
+		await sleep(200);
+		assert.strictEqual(noticeOf(rt).length, 0, "no notice before the match");
+		// Abort the 5 s stop wait early so the stop reply returns while the TERM-ignoring
+		// job is still alive (SIGKILL grace is 2 s out). The watch must stay armed.
+		const ac = new AbortController();
+		const stopP = rt.job({ action: "stop", job_id: jobId }, ac.signal);
+		setTimeout(() => ac.abort(), 100);
+		const stopped = await stopP;
+		const stoppedText = text(stopped);
+		assert.match(stoppedText, /has not exited yet/, "survived stop reports still running");
+		assert.match(stoppedText, /still armed/, "survived stop discloses the armed watch");
+		// The READY line prints at ~0.6 s, after the stop reply: it must still notify.
+		await waitFor(() => noticeOf(rt).length === 1, 5000, "ready notice after survived stop");
+		assert.match(noticeOf(rt)[0]!.message.content, /\[bash job ready\]/);
+		assert.match(noticeOf(rt)[0]!.message.content, /READY-SURVIVED-AAA/);
+		await rt.job({ action: "stop", job_id: jobId });
+		await sleep(400);
+	});
+
+	test("(b) stop-killed job disarms with truthful reply text in both cases", async () => {
+		// Killed case: the job exits from the stop, the watch is disarmed, the reply says so.
+		const rt1 = runtime("ready-stop-killed");
+		const r1 = await rt1.bash({
+			command: "sleep 30",
+			run_in_background: true,
+			ready_pattern: "READY-NEVER-PRINTS",
+		});
+		const id1 = r1.details.jobId as string;
+		const stopped1 = await rt1.job({ action: "stop", job_id: id1 });
+		const t1 = text(stopped1);
+		assert.match(t1, /was stopped/, "killed stop reports the completion");
+		assert.match(t1, /disarmed/, "killed stop discloses the disarmed watch");
+		await sleep(600);
+		assert.strictEqual(noticeOf(rt1).length, 0, "killed stop sends no later ready notice");
+
+		// Survived case: the reply must instead say the watch is still armed (truthful).
+		const rt2 = runtime("ready-stop-truth");
+		const r2 = await rt2.bash({
+			command: "trap '' TERM; sleep 0.6; echo READY-TRUTH-BBB; sleep 30",
+			run_in_background: true,
+			ready_pattern: "READY-TRUTH-BBB",
+		});
+		const id2 = r2.details.jobId as string;
+		await sleep(150);
+		const ac2 = new AbortController();
+		const p2 = rt2.job({ action: "stop", job_id: id2 }, ac2.signal);
+		setTimeout(() => ac2.abort(), 100);
+		const s2 = await p2;
+		assert.match(text(s2), /has not exited yet/);
+		assert.match(text(s2), /still armed/, "survived stop discloses the armed watch");
+		await waitFor(() => noticeOf(rt2).length === 1, 5000, "truth-case later match notifies");
+		await rt2.job({ action: "stop", job_id: id2 });
+		await sleep(300);
+	});
+});

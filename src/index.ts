@@ -933,18 +933,30 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			if (params.action === "stop") {
 				// Delegates truthfulness to the manager's first-reason-wins requestStop:
 				// a stop on a settled job returns its recorded outcome, never synthesizes `stopped`.
+				// The readiness watch is disarmed only when the job actually exits (issue #1,
+				// option A): a survived stop keeps it armed so a later match still notifies.
 				if (job.running) {
 					job.delivered = true;
-					job.readyDelivered = true;
 					void mgr.requestStop(job, "stopped");
 					await mgr.wait(job, STOP_WAIT_MS, signal);
 				}
 				job.delivered = true;
-				job.readyDelivered = true;
 				const notify = notifyOfJob(job.id);
 				const text = job.running
-					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath} Notify: ${notify}.`
-					: `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
+					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath} Notify: ${notify}.${
+							job.readySource
+								? job.readyFired || job.readyExpired || job.readyDelivered
+										? " Its readiness watch is no longer armed."
+										: " Its readiness watch is still armed."
+								: ""
+						}`
+					: `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.${
+							job.readySource ? " Its readiness watch is disarmed." : ""
+						}`;
+				// Disarm on exit, but never drop an already-fired notice: a match found
+				// during the stop wait (or at settle) is still reported ahead of the
+				// completion, like the no-stop flow. Only an unfired watch is marked.
+				if (!job.running && !job.readyFired) job.readyDelivered = true;
 				// The entry stays until retention eviction (or take): the map is bounded by
 				// the job cap through the eviction hook, and a later status re-query must
 				// still report the real policy.

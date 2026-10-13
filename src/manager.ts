@@ -276,14 +276,26 @@ const READY_LINE_TEST_MAX_CHARS = 4096;
  * line is evaluated against the pattern exactly once, in order. Fires at most once ever: after
  * the first match every later `push` returns []. A trailing partial line is held until it
  * completes. Lines are matched raw (only a trailing carriage return is stripped).
+ *
+ * Incremental offsets (issue #5): only the new tail is scanned per tick. The old
+ * implementation did `buffer += chunk` then `indexOf` over the whole history, copying
+ * tens of MB per tick for newline-free output. Here the undecided tail is capped to the
+ * ReDoS prefix (`READY_LINE_TEST_MAX_CHARS`): only the first 4096 chars of a line are
+ * ever tested, so middle bytes past the cap are counted but never stored. Per-tick work
+ * is O(new bytes) and the held tail stays small by construction.
  */
 export class ReadyLineMatcher {
 	private readonly pattern: RegExp;
-	private buffer = "";
+	/** First bytes (up to the test cap) of the current undecided partial line. */
+	private pendingPrefix = "";
+	/** Total length of the current undecided partial line, including discarded middle. */
+	private pendingLen = 0;
 	private nextIndex = 0;
 	private done = false;
 	/** The completed line that matched, once fired. */
 	matchedLine: string | undefined;
+	/** Test seam: total new bytes examined for newlines (sums `push` chunk lengths). */
+	scannedBytes = 0;
 
 	constructor(pattern: RegExp) {
 		this.pattern = pattern;
@@ -293,25 +305,94 @@ export class ReadyLineMatcher {
 		return this.done;
 	}
 
+	/** Stored undecided tail size; bounded by the test cap (small by construction). */
+	get pendingBytes(): number {
+		return this.pendingPrefix.length;
+	}
+
 	/**
 	 * Feed new output text. Returns the indices of newly completed lines that match
 	 * (at most one entry, and empty on every call after the first match).
+	 * Only the new chunk is scanned for newlines; already-scanned history is never
+	 * re-scanned or re-copied.
 	 */
 	push(chunk: string): number[] {
 		if (this.done || chunk === "") return [];
-		this.buffer += chunk;
-		let nl: number;
-		while ((nl = this.buffer.indexOf("\n")) >= 0) {
-			let line = this.buffer.slice(0, nl);
-			this.buffer = this.buffer.slice(nl + 1);
-			if (line.endsWith("\r")) line = line.slice(0, -1);
+		this.scannedBytes += chunk.length;
+		let pos = 0;
+		while (true) {
+			const nl = chunk.indexOf("\n", pos);
+			if (nl < 0) break;
+			if (this.pendingLen > 0) {
+				// The pending partial plus this segment completes one line.
+				const segLen = nl - pos;
+				const totalLen = this.pendingLen + segLen;
+				const index = this.nextIndex++;
+				let matched: string;
+				let isMatch: boolean;
+				if (totalLen <= READY_LINE_TEST_MAX_CHARS) {
+					let line = this.pendingPrefix + chunk.slice(pos, nl);
+					if (line.endsWith("\r")) line = line.slice(0, -1);
+					isMatch = this.testLine(line);
+					matched = line;
+				} else {
+					// Long line: only the first cap bytes decide, and the trailing CR
+					// (past the cap) cannot affect them, so no strip is needed.
+					let prefix: string;
+					if (this.pendingPrefix.length >= READY_LINE_TEST_MAX_CHARS) {
+						prefix = this.pendingPrefix.slice(0, READY_LINE_TEST_MAX_CHARS);
+					} else {
+						const need = READY_LINE_TEST_MAX_CHARS - this.pendingPrefix.length;
+						prefix = this.pendingPrefix + chunk.slice(pos, pos + need);
+					}
+					isMatch = this.testLine(prefix);
+					matched = prefix;
+				}
+				this.pendingPrefix = "";
+				this.pendingLen = 0;
+				pos = nl + 1;
+				if (isMatch) {
+					this.done = true;
+					this.matchedLine = matched;
+					return [index];
+				}
+				continue;
+			}
+			const segLen = nl - pos;
 			const index = this.nextIndex++;
-			if (this.testLine(line)) {
+			let matched: string;
+			let isMatch: boolean;
+			if (segLen <= READY_LINE_TEST_MAX_CHARS) {
+				let line = chunk.slice(pos, nl);
+				if (line.endsWith("\r")) line = line.slice(0, -1);
+				isMatch = this.testLine(line);
+				matched = line;
+			} else {
+				const prefix = chunk.slice(pos, pos + READY_LINE_TEST_MAX_CHARS);
+				isMatch = this.testLine(prefix);
+				matched = prefix;
+			}
+			pos = nl + 1;
+			if (isMatch) {
 				this.done = true;
-				this.matchedLine = line;
-				// The watch is over; buffered text (complete or partial) is never scanned.
-				this.buffer = "";
+				this.matchedLine = matched;
 				return [index];
+			}
+		}
+		// Trailing after the last newline extends the undecided partial, capped to the prefix.
+		const tailLen = chunk.length - pos;
+		if (tailLen > 0) {
+			if (this.pendingLen >= READY_LINE_TEST_MAX_CHARS) {
+				this.pendingLen += tailLen;
+			} else {
+				const space = READY_LINE_TEST_MAX_CHARS - this.pendingPrefix.length;
+				if (tailLen <= space) {
+					this.pendingPrefix += chunk.slice(pos);
+					this.pendingLen += tailLen;
+				} else {
+					this.pendingPrefix += chunk.slice(pos, pos + space);
+					this.pendingLen += tailLen;
+				}
 			}
 		}
 		return [];
@@ -326,15 +407,23 @@ export class ReadyLineMatcher {
 	 * Treat buffered partial text as one final complete line. Call once at settle, when no
 	 * more output is coming: an unterminated trailing line would otherwise never be tested.
 	 * The watch is over either way; returns [index] on match, [] otherwise.
+	 * Only the capped prefix is tested, matching `push` (a past-cap match stays missed).
 	 */
 	flush(): number[] {
 		if (this.done) return [];
 		this.done = true;
-		if (this.buffer === "") return [];
-		let line = this.buffer;
-		this.buffer = "";
-		if (line.endsWith("\r")) line = line.slice(0, -1);
+		if (this.pendingLen === 0) return [];
 		const index = this.nextIndex++;
+		let line: string;
+		if (this.pendingLen <= READY_LINE_TEST_MAX_CHARS) {
+			line = this.pendingPrefix;
+			if (line.endsWith("\r")) line = line.slice(0, -1);
+		} else {
+			// Long tail: the trailing CR (past the cap) cannot affect the tested prefix.
+			line = this.pendingPrefix.slice(0, READY_LINE_TEST_MAX_CHARS);
+		}
+		this.pendingPrefix = "";
+		this.pendingLen = 0;
 		if (this.testLine(line)) {
 			this.matchedLine = line;
 			return [index];
