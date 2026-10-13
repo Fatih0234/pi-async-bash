@@ -18,7 +18,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import { constants as osConstants } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 export const MAX_TIMER_MS = 2_147_483_647;
@@ -38,6 +38,18 @@ export type StopReason = "stopped" | "aborted" | "timed_out" | "output_limit" | 
 export type JobOwner = "foreground" | "background";
 
 export type JobChange = "start" | "handoff" | "stop" | "finish";
+
+/**
+ * One line of the `PI_ASYNC_BASH_EVENT_LOG` JSONL contract. `started` carries no
+ * `status`; `settled` carries the final first-reason-wins status. `ts` is epoch ms.
+ */
+export interface JobEvent {
+	event: "started" | "settled";
+	job_id: string;
+	command: string;
+	status?: JobStatus;
+	ts: number;
+}
 
 export interface JobSpec {
 	/** Text handed to the shell. */
@@ -104,6 +116,12 @@ export interface JobManagerOptions {
 	monitorIntervalMs?: number;
 	/** Do not keep the Node event loop alive for background jobs (the extension sets this). */
 	unref?: boolean;
+	/**
+	 * Path of the JSONL job-event log (`PI_ASYNC_BASH_EVENT_LOG`). Each job appends one
+	 * `started` line at launch and one `settled` line at completion, each via a single
+	 * synchronous append. Unset disables the log.
+	 */
+	eventLogPath?: string;
 	/** Called once when a background-owned job finishes and its result was not yet delivered. */
 	onBackgroundComplete?: (job: Job) => void;
 	/** Called at most once per job, when a new output line first matches its readiness watch. */
@@ -440,8 +458,8 @@ export function pruneSessionLogDirs(base: string, maxAgeMs: number, keep: string
 
 export class JobManager {
 	readonly logDir: string;
-	private readonly opts: Required<Omit<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange">> &
-		Pick<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange">;
+	private readonly opts: Required<Omit<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange" | "eventLogPath">> &
+		Pick<JobManagerOptions, "onBackgroundComplete" | "onReady" | "commandOnStdin" | "onChange" | "eventLogPath">;
 	private readonly jobs = new Map<string, Job>();
 	/** Cleanup must outlive result release and completed-job retention eviction. */
 	private readonly pendingGroupCleanup = new Set<Job>();
@@ -522,6 +540,7 @@ export class JobManager {
 		const job = new Job(id, spec, logPath, this.opts.now());
 		this.jobs.set(id, job);
 		this.installExitHook();
+		this.appendJobEvent(job, "started");
 
 		let child: ChildProcess;
 		try {
@@ -574,6 +593,28 @@ export class JobManager {
 		this.ensureMonitor();
 		this.notifyChange(job, "start");
 		return job;
+	}
+
+	/**
+	 * Append one event to the JSONL event log, if configured. One synchronous append call
+	 * per event; parent directories are created as needed. Never throws into the job
+	 * lifecycle: I/O failure leaves one short fixed stderr note instead.
+	 */
+	private appendJobEvent(job: Job, event: JobEvent["event"]): void {
+		const path = this.opts.eventLogPath;
+		if (!path) return;
+		const entry: JobEvent =
+			event === "started"
+				? { event, job_id: job.id, command: job.command, ts: this.opts.now() }
+				: { event, job_id: job.id, command: job.command, status: job.status, ts: this.opts.now() };
+		try {
+			fs.mkdirSync(dirname(path), { recursive: true });
+			fs.appendFileSync(path, `${JSON.stringify(entry)}\n`);
+		} catch {
+			try {
+				process.stderr.write("[pi-async-bash: event log append failed]\n");
+			} catch {}
+		}
 	}
 
 	private notifyChange(job: Job, change: JobChange): void {
@@ -732,6 +773,8 @@ export class JobManager {
 			this.trimLog(job);
 		}
 		job.status = status;
+		// finish() returns early once the job is done, so `settled` is appended exactly once.
+		this.appendJobEvent(job, "settled");
 		job.resolveLaunched(status !== "spawn_error");
 		// Disk accounting and retention run before anyone observes the result.
 		this.enforceRetention();

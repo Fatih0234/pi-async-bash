@@ -56,6 +56,8 @@ const DEFAULT_FOREGROUND_MS = 10000;
 export interface AsyncBashConfig {
 	/** Automatic handoff budget in ms; null waits for completion (explicit background still works). */
 	foregroundMs: number | null;
+	/** JSONL job-event log path (`PI_ASYNC_BASH_EVENT_LOG`); undefined disables the log. */
+	eventLogPath: string | undefined;
 	logBase: string;
 	manager: Partial<Omit<JobManagerOptions, "logDir" | "onBackgroundComplete">>;
 }
@@ -126,7 +128,8 @@ export function resolveForegroundMs(
  * Resolve user configuration. Precedence: `--bash-foreground-ms` flag, then
  * `PI_ASYNC_BASH_FOREGROUND_MS`, then the `asyncBash.foregroundMs` Pi setting, then the mode
  * default (10000 ms; off in one-shot print/json mode, where Pi exits after the run and would
- * kill handed-off jobs).
+ * kill handed-off jobs). `PI_ASYNC_BASH_EVENT_LOG` (blank means unset) selects the JSONL
+ * job-event log; each job appends one `started` and one `settled` object per line.
  */
 export function resolveConfig(
 	flag: string | undefined,
@@ -147,8 +150,10 @@ export function resolveConfig(
 	if (maxLog) manager.maxLogBytes = maxLog;
 	const maxTotal = mb("PI_ASYNC_BASH_SESSION_LOG_MB");
 	if (maxTotal) manager.maxTotalLogBytes = maxTotal;
+	const eventLogRaw = env.PI_ASYNC_BASH_EVENT_LOG?.trim();
 	return {
 		foregroundMs,
+		eventLogPath: eventLogRaw ? eventLogRaw : undefined,
 		logBase: env.PI_ASYNC_BASH_LOG_DIR || join(tmpdir(), `pi-async-bash-${uid}`),
 		manager,
 	};
@@ -385,6 +390,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			const owner = { sessionId };
 			const created = new JobManager({
 				...cfg.manager,
+				eventLogPath: cfg.eventLogPath,
 				logDir,
 				shell: shell.shell,
 				shellArgs: shell.args,

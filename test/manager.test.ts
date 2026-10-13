@@ -375,6 +375,32 @@ describe("event loop ownership", () => {
 	});
 });
 
+describe("event log", () => {
+	test("start+settle appends exactly 2 whole JSON lines", async () => {
+		const dir = tempDir();
+		const logPath = join(dir, "nested", "events.jsonl");
+		const { mgr } = make({ eventLogPath: logPath });
+		const job = mgr.start({ command: "echo hi", cwd: "/" });
+		const info = await job.done;
+		const raw = fs.readFileSync(logPath, "utf8");
+		assert.ok(raw.endsWith("\n"), "each event is one whole line");
+		const lines = raw.split("\n").filter((line) => line !== "");
+		assert.strictEqual(lines.length, 2);
+		const started = JSON.parse(lines[0]!);
+		const settled = JSON.parse(lines[1]!);
+		assert.deepStrictEqual(Object.keys(started).sort(), ["command", "event", "job_id", "ts"]);
+		assert.equal(started.event, "started");
+		assert.equal(started.job_id, job.id);
+		assert.equal(started.command, "echo hi");
+		assert.equal(typeof started.ts, "number");
+		assert.equal(settled.event, "settled");
+		assert.equal(settled.job_id, job.id);
+		assert.equal(settled.command, "echo hi");
+		assert.equal(settled.status, info.status);
+		assert.equal(typeof settled.ts, "number");
+	});
+});
+
 describe("log helpers", () => {
 	test("tail of an enormous single line is bounded", () => {
 		const dir = tempDir();
