@@ -257,6 +257,16 @@ export function validateReadyTimeoutMs(readyTimeoutMs: number | undefined): void
 const READY_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
+ * Per completed line, at most this many characters are tested against the readiness
+ * pattern. Patterns are model-supplied and run on the shared monitor tick, so testing an
+ * unbounded line (up to `maxLogBytes`) under a catastrophically backtracking pattern
+ * would stall readiness scans and output-limit checks for every job. Only the line prefix
+ * is tested; a match past the cap is missed. (There is no non-backtracking engine without
+ * new dependencies; the tick's byte cap still bounds total work per tick.)
+ */
+const READY_LINE_TEST_MAX_CHARS = 4096;
+
+/**
  * Incremental per-line matcher for a readiness watch. Feed only new output text: each complete
  * line is evaluated against the pattern exactly once, in order. Fires at most once ever: after
  * the first match every later `push` returns []. A trailing partial line is held until it
@@ -291,13 +301,38 @@ export class ReadyLineMatcher {
 			this.buffer = this.buffer.slice(nl + 1);
 			if (line.endsWith("\r")) line = line.slice(0, -1);
 			const index = this.nextIndex++;
-			if (this.pattern.test(line)) {
+			if (this.testLine(line)) {
 				this.done = true;
 				this.matchedLine = line;
 				// The watch is over; buffered text (complete or partial) is never scanned.
 				this.buffer = "";
 				return [index];
 			}
+		}
+		return [];
+	}
+
+	/** Test one complete line, capped so a long line cannot stall the shared monitor tick. */
+	private testLine(line: string): boolean {
+		return this.pattern.test(line.length > READY_LINE_TEST_MAX_CHARS ? line.slice(0, READY_LINE_TEST_MAX_CHARS) : line);
+	}
+
+	/**
+	 * Treat buffered partial text as one final complete line. Call once at settle, when no
+	 * more output is coming: an unterminated trailing line would otherwise never be tested.
+	 * The watch is over either way; returns [index] on match, [] otherwise.
+	 */
+	flush(): number[] {
+		if (this.done) return [];
+		this.done = true;
+		if (this.buffer === "") return [];
+		let line = this.buffer;
+		this.buffer = "";
+		if (line.endsWith("\r")) line = line.slice(0, -1);
+		const index = this.nextIndex++;
+		if (this.testLine(line)) {
+			this.matchedLine = line;
+			return [index];
 		}
 		return [];
 	}
@@ -339,27 +374,52 @@ function groupAlive(pid: number): boolean {
 }
 
 /**
+ * OS hooks for the `/proc` leader check below, exposed so tests can simulate a missing
+ * `/proc` (macOS/BSD/proc-less Linux). Production code reads the real `/proc` filesystem.
+ */
+export const procHooks = {
+	readPidStat(pid: number): string {
+		return fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+	},
+	/** Probe read proving `/proc` itself is mounted; disambiguates an ENOENT pid read. */
+	readSelfStat(): string {
+		return fs.readFileSync("/proc/self/stat", "utf8");
+	},
+};
+
+/**
  * Synchronous OS-level check for a leader that exited before Node delivered its
  * `exit` event (SIGCHLD is observed on the next tick). A zombie (`Z`) or gone
  * (`X`/ENOENT) leader means a stop request raced a natural exit: the caller must
  * not synthesize `stopped` or send signals, but return the pending natural outcome.
+ *
+ * `/proc` exists only on Linux: elsewhere the check is skipped (assume alive) so
+ * stop/abort/timeout/output_limit/shutdown still signal. On Linux an ENOENT pid read is
+ * ambiguous (exited leader vs. unmounted `/proc`), so it counts as exited only when
+ * `/proc` itself answers; otherwise assume alive and signal.
  */
 function leaderExitedBeforeExitEvent(job: Job): boolean {
 	const child = job.child;
 	if (child && (child.exitCode !== null || child.signalCode !== null)) return true;
 	const pid = job.pid;
-	if (!pid || process.platform === "win32") return false;
+	if (!pid || process.platform !== "linux") return false;
+	let stat: string;
 	try {
-		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const close = stat.lastIndexOf(")");
-		if (close < 0) return false;
-		const state = stat.slice(close + 2, close + 3);
-		return state === "Z" || state === "X" || state === "x";
+		stat = procHooks.readPidStat(pid);
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException).code;
-		if (code === "ENOENT" || code === "ESRCH") return true;
-		return false;
+		if (code !== "ENOENT" && code !== "ESRCH") return false;
+		try {
+			procHooks.readSelfStat();
+		} catch {
+			return false;
+		}
+		return true;
 	}
+	const close = stat.lastIndexOf(")");
+	if (close < 0) return false;
+	const state = stat.slice(close + 2, close + 3);
+	return state === "Z" || state === "X" || state === "x";
 }
 
 const TRIM_HEADER = (dropped: number) => `[pi-async-bash: ${dropped} earlier bytes removed; output exceeded the log limit]\n`;
@@ -756,6 +816,9 @@ export class JobManager {
 
 	private finish(job: Job, status: JobStatus, exitCode: number | null, signal: NodeJS.Signals | null, error?: string): void {
 		if (!job.running) return;
+		// Settle-time readiness scan (output before the first tick, unterminated final
+		// line): must run while the job is still marked running.
+		this.finishReadyScan(job);
 		job.endedAt = this.opts.now();
 		job.exitCode = exitCode;
 		job.signal = signal;
@@ -911,19 +974,52 @@ export class JobManager {
 			// The decoder holds a split trailing character; the matcher holds a split trailing line.
 			const text = job.readyDecoder.write(buf.subarray(0, read));
 			if (job.readyMatcher.push(text).length === 0) return false;
-			job.readyFired = true;
-			job.readyLine = job.readyMatcher.matchedLine;
-			if (job.readyTimer) clearTimeout(job.readyTimer);
-			job.readyTimer = undefined;
-			if (!this.disposed) {
-				try {
-					this.opts.onReady?.(job);
-				} catch {}
-			}
+			this.fireReady(job);
 			return true;
 		} finally {
 			fs.closeSync(fd);
 		}
+	}
+
+	/**
+	 * Record a readiness watch firing and notify once. The job keeps running; delivery
+	 * decides whether the notice still goes out (a match found at settle is reported
+	 * ahead of the completion notice).
+	 */
+	private fireReady(job: Job): void {
+		job.readyFired = true;
+		job.readyLine = job.readyMatcher?.matchedLine;
+		if (job.readyTimer) clearTimeout(job.readyTimer);
+		job.readyTimer = undefined;
+		if (!this.disposed) {
+			try {
+				this.opts.onReady?.(job);
+			} catch {}
+		}
+	}
+
+	/**
+	 * One last readiness scan at settle, before the timer is cleared: output written since
+	 * the last tick (or before the first tick for fast jobs) still deserves its one-shot
+	 * notice. Runs while the job is still marked running so `checkReady` does not skip it,
+	 * then flushes the decoder and treats a trailing unterminated line as complete, since
+	 * no more output is coming. Never throws into `finish()`.
+	 */
+	private finishReadyScan(job: Job): void {
+		if (!job.readyRegex || !job.readyMatcher || !job.readyDecoder) return;
+		if (job.readyFired || job.readyExpired) return;
+		try {
+			this.checkReady(job);
+		} catch {}
+		try {
+			if (job.readyFired || !job.readyMatcher || !job.readyDecoder) return;
+			const tail = job.readyDecoder.end();
+			if (tail !== "" && job.readyMatcher.push(tail).length > 0) {
+				this.fireReady(job);
+				return;
+			}
+			if (job.readyMatcher.flush().length > 0) this.fireReady(job);
+		} catch {}
 	}
 
 	/** Scan every running watched job for a readiness match. Called on each monitor tick. */

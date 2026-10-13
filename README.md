@@ -44,7 +44,7 @@ pi --bash-foreground-ms 5000   # Wait five seconds before handoff
 pi --bash-foreground-ms off    # Only background when explicitly requested
 ```
 
-Or set `PI_ASYNC_BASH_FOREGROUND_MS`. The flag takes precedence.
+Or set `PI_ASYNC_BASH_FOREGROUND_MS`, or the `asyncBash.foregroundMs` Pi setting. Precedence: flag, then env, then setting, then the 10 s default.
 
 Set `PI_ASYNC_BASH_EVENT_LOG=/path/to/events.jsonl` to record every job as
 one JSON object per line:
@@ -53,7 +53,8 @@ Each event is a single append; parent directories are created as needed, and
 log I/O failures never break jobs. Consumer contract: read whole lines,
 parse each as JSON; `started` carries no `status` and no `exitCode`,
 `settled` carries the final status plus the process `exitCode`
-(`0` for a clean exit, `null` when no exit code exists e.g. signal kill),
+(numeric: `0` for a clean exit, `128+n` on signal kill;
+`null` only when the process never started, i.e. `spawn_error`),
 `ts` is epoch milliseconds.
 
 Jobs belong to the session: **quitting, switching sessions, or reloading stops them**. In print/JSON mode, handoff is opt-in with `--bash-foreground-ms 2000`; pending job results are delivered before the run exits. Stop unneeded servers and watchers before finishing. Process cleanup covers the process group, not escaped daemons.

@@ -10,10 +10,12 @@ import {
 	type Job,
 	JobManager,
 	type JobManagerOptions,
+	procHooks,
 	pruneSessionLogDirs,
 	readLogTail,
 	ReadyLineMatcher,
 } from "../src/manager.ts";
+import { resolveConfig } from "../src/index.ts";
 import { alive, sleep, tempDir, waitFor } from "./helpers.ts";
 
 const managers: JobManager[] = [];
@@ -467,6 +469,100 @@ describe("log helpers", () => {
 	});
 });
 
+describe("stop without /proc", () => {
+	test("stop signals when /proc is missing (macOS/BSD/proc-less Linux)", async () => {
+		const { mgr } = make();
+		const job = mgr.start({ command: "sleep 30", cwd: "/", background: true });
+		await job.launched;
+		const pid = job.pid!;
+		assert.ok(alive(pid));
+		const origPidStat = procHooks.readPidStat;
+		const origSelfStat = procHooks.readSelfStat;
+		const missingProc = (): string => {
+			const err = new Error("ENOENT: no such file or directory, open '/proc/1/stat'") as NodeJS.ErrnoException;
+			err.code = "ENOENT";
+			throw err;
+		};
+		procHooks.readPidStat = missingProc;
+		procHooks.readSelfStat = missingProc;
+		try {
+			// Every /proc read reports ENOENT, as on a system without /proc: the stop
+			// must still signal instead of mistaking the leader for exited.
+			const info = await mgr.requestStop(job, "stopped");
+			assert.equal(info.status, "stopped");
+			await waitFor(() => !alive(pid), 3000, "process to die after stop without /proc");
+		} finally {
+			procHooks.readPidStat = origPidStat;
+			procHooks.readSelfStat = origSelfStat;
+		}
+	});
+});
+
+describe("readiness settle scan", () => {
+	test("output before the first tick still fires the ready notice", async () => {
+		const fired: Job[] = [];
+		const { mgr } = make({ onReady: (job) => fired.push(job) });
+		const job = mgr.start({ command: "echo READY-FLUSH", cwd: "/", background: true, readyPattern: "READY-FLUSH" });
+		const info = await job.done;
+		assert.equal(info.status, "exited");
+		assert.equal(job.readyFired, true);
+		assert.equal(job.readyLine, "READY-FLUSH");
+		assert.deepEqual(fired, [job]);
+	});
+
+	test("an unterminated final line matches at settle", async () => {
+		const fired: Job[] = [];
+		const { mgr } = make({ onReady: (job) => fired.push(job) });
+		const job = mgr.start({ command: "printf 'READY-NO-NL'", cwd: "/", background: true, readyPattern: "READY-NO-NL" });
+		await job.done;
+		assert.equal(job.readyFired, true);
+		assert.equal(job.readyLine, "READY-NO-NL");
+		assert.deepEqual(fired, [job]);
+	});
+});
+
+describe("event log branches", () => {
+	test("unset log disables events without affecting jobs", async () => {
+		const { mgr } = make();
+		const job = mgr.start({ command: "echo no-log", cwd: "/" });
+		const info = await job.done;
+		assert.equal(info.status, "exited");
+		assert.equal(info.exitCode, 0);
+	});
+
+	test("blank PI_ASYNC_BASH_EVENT_LOG resolves to no log", () => {
+		assert.equal(resolveConfig(undefined, "tui", {}).eventLogPath, undefined);
+		assert.equal(resolveConfig(undefined, "tui", { PI_ASYNC_BASH_EVENT_LOG: "   " }).eventLogPath, undefined);
+		const logPath = join(tempDir(), "events.jsonl");
+		assert.equal(resolveConfig(undefined, "tui", { PI_ASYNC_BASH_EVENT_LOG: logPath }).eventLogPath, logPath);
+	});
+
+	test("log I/O failure never breaks jobs", async () => {
+		const dir = tempDir();
+		const blocker = join(dir, "blocker");
+		fs.writeFileSync(blocker, "not a directory");
+		const { mgr } = make({ eventLogPath: join(blocker, "events.jsonl") });
+		let warnings = 0;
+		const origWrite = process.stderr.write;
+		// biome-ignore lint/suspicious/noExplicitAny: test-only stderr probe
+		(process.stderr as any).write = (...args: any[]) => {
+			warnings++;
+			// biome-ignore lint/suspicious/noExplicitAny: test-only stderr probe
+			return (origWrite as (...a: any[]) => boolean).apply(process.stderr, args);
+		};
+		try {
+			const job = mgr.start({ command: "echo resilient", cwd: "/" });
+			const info = await job.done;
+			assert.equal(info.status, "exited");
+			assert.equal(info.exitCode, 0);
+			assert.equal(mgr.tail(job, 1000, 10).text, "resilient");
+			assert.ok(warnings >= 2, `expected started+settled warnings, got ${warnings}`);
+		} finally {
+			// biome-ignore lint/suspicious/noExplicitAny: test-only stderr probe
+			(process.stderr as any).write = origWrite;
+		}
+	});
+});
 describe("readiness line matcher", () => {
 	test("fires once, on the second line only", () => {
 		// lines ["starting", "listening on :3000"] with pattern "listening on :\\d+" fires once, on the second line only

@@ -449,14 +449,15 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Take readiness watches that fired and deserve an early notice. A notice goes out only
-	 * while the job is still background-owned and running: a job that finished first is
-	 * reported through its completion notice instead, and a foreground-owned match through
-	 * the foreground/handoff result. Everything dequeued is marked so it never wakes twice.
+	 * Take readiness watches that fired and deserve a notice. A notice goes out for
+	 * background-owned jobs: while running (the early case), or for a match found at
+	 * settle when fast output exited before the first tick (reported ahead of the
+	 * completion notice). A foreground-owned match goes through the foreground/handoff
+	 * result instead. Everything dequeued is marked so it never wakes twice.
 	 */
 	const takeReady = (): Job[] => {
 		const jobs = readyPending.filter(
-			(job) => !job.readyDelivered && job.running && job.owner === "background" && notifyOfJob(job.id) !== "silent",
+			(job) => !job.readyDelivered && job.owner === "background" && notifyOfJob(job.id) !== "silent",
 		);
 		for (const job of readyPending) job.readyDelivered = true;
 		readyPending = [];
@@ -486,7 +487,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			`Command: ${oneLine(info.command)}`,
 			job.readyLine !== undefined ? `Matched line: ${oneLine(job.readyLine)}` : undefined,
 			`Full output log: ${info.logPath}`,
-			`It keeps running after ${seconds(elapsed)}. You will be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`,
+			job.running
+				? `It keeps running after ${seconds(elapsed)}. You will be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`
+				: `It has since finished; its completion is reported separately. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`,
 		];
 		if (manager && tailLines > 0) {
 			const tail = manager.tail(job, tailBytes, tailLines);

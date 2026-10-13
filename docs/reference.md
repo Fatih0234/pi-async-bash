@@ -7,7 +7,7 @@ A Pi extension that replaces the `bash` tool with one whose processes belong to 
 - A command that finishes within the foreground budget (default 10 s) returns like Pi's builtin `bash`: bounded output and exit status; a nonzero exit is a tool error.
 - A command still running at the budget keeps running as a background job. The tool returns a job ID, `running` status, and the full log path. The result says the command has **not** completed.
 - `run_in_background: true` returns as soon as the process has launched.
-- When a background job finishes, the model is told once: job ID, exit status or kill reason, the last 20 lines (2 KB), and the log path.
+- When a background job finishes, the model is told once (unless the job was started with `notify: silent`, which never wakes; check it with `bash_job`): job ID, exit status or kill reason, the last 20 lines (2 KB), and the log path.
 - `bash_job` with `action` `list`, `status`, `wait` (bounded, default 30 s, max 600 s) or `stop` (process tree). It cannot start processes.
 
 ## Behavior
@@ -94,11 +94,11 @@ From Pi's builtin `bash`:
 
 ## Activation and rollback
 
-Install: `pi install git:github.com/isthatyousaf/pi-async-bash`, then restart Pi or run `/reload`.
+Install: `pi install git:github.com/Fatih0234/pi-async-bash`, then restart Pi or run `/reload`.
 
 Try a local checkout for one run: `pi -e ./src/index.ts` (add `--bash-foreground-ms 5000` to change the budget).
 
-Uninstall: `pi remove git:github.com/isthatyousaf/pi-async-bash`, then restart or `/reload`. If installed through an explicit `extensions` path instead, remove that path. Pi's builtin `bash` returns automatically. Reload stops running jobs.
+Uninstall: `pi remove git:github.com/Fatih0234/pi-async-bash`, then restart or `/reload`. If installed through an explicit `extensions` path instead, remove that path. Pi's builtin `bash` returns automatically. Reload stops running jobs.
 
 ## Development
 

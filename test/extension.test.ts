@@ -111,6 +111,29 @@ describe("registration and config", () => {
 		assert.equal(result.details.background, undefined);
 		assert.equal(text(result), "waited-via-settings");
 	});
+
+	test("PI_ASYNC_BASH_EVENT_LOG wires through resolveConfig into the manager", async () => {
+		const dir = tempDir("pab-evt-");
+		const logPath = join(dir, "events.jsonl");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = logPath;
+		try {
+			assert.equal(resolveConfig(undefined, "tui", process.env).eventLogPath, logPath);
+			const rt = runtime("evt-log");
+			const result = await rt.bash({ command: "echo wired" });
+			assert.equal(text(result), "wired");
+			const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+			assert.equal(lines.length, 2);
+			const started = JSON.parse(lines[0]!);
+			const settled = JSON.parse(lines[1]!);
+			assert.equal(started.event, "started");
+			assert.equal(settled.event, "settled");
+			assert.equal(settled.job_id, started.job_id);
+			assert.equal(settled.status, "exited");
+			assert.equal(settled.exitCode, 0);
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
 });
 
 describe("bash tool", () => {
@@ -591,5 +614,25 @@ describe("readiness watch", () => {
 			/Invalid ready_timeout_s: requires ready_pattern/,
 		);
 		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+
+	test("expired watch disarms: job keeps running with no notice, even for a later match", async () => {
+		const rt = runtime("ready-expiry");
+		const result = await rt.bash({
+			command: "sleep 0.6; echo READY-AFTER-EXPIRY; sleep 30",
+			run_in_background: true,
+			ready_pattern: "READY-AFTER-EXPIRY",
+			ready_timeout_s: 0.3,
+		});
+		const jobId = result.details.jobId as string;
+		await sleep(1500);
+		assert.strictEqual(noticeOf(rt).length, 0, "no ready notice after expiry");
+		assert.deepEqual(await rt.emit("turn_end", { outcome: "completed" }), [undefined]);
+		const status = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(status), /still running/);
+		assert.match(text(status), /READY-AFTER-EXPIRY/, "the line arrived after the watch expired");
+		await rt.job({ action: "stop", job_id: jobId });
+		await sleep(600);
+		assert.strictEqual(noticeOf(rt).length, 0, "stopping an expired watch sends no notice");
 	});
 });
