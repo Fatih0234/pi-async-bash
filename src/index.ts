@@ -153,6 +153,15 @@ export function resolveConfig(
 	};
 }
 
+export type NotifyPolicy = "wake" | "silent";
+
+/** Validate the per-call wake policy: `undefined` defaults to `"wake"`. */
+export function resolveNotify(value: unknown): NotifyPolicy {
+	if (value === undefined) return "wake";
+	if (value === "wake" || value === "silent") return value;
+	throw new Error('Invalid notify: must be "wake" or "silent"');
+}
+
 export function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 	if (timeout === undefined) return undefined;
 	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
@@ -180,6 +189,12 @@ const bashSchema = Type.Object({
 		Type.Boolean({
 			description:
 				"Start the command as a background job and return right away with its job ID and log path. Use for servers, watchers, and long builds.",
+		}),
+	),
+	notify: Type.Optional(
+		Type.Union([Type.Literal("wake"), Type.Literal("silent")], {
+			description:
+				'Wake policy when the job finishes in the background: "wake" (default) sends a completion notice; "silent" never wakes, check it with bash_job.',
 		}),
 	),
 });
@@ -277,6 +292,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	const board = new JobBoard();
 	/** Jobs the user stopped from the jobs panel (phrased as such for the model). */
 	const userStopped = new Set<string>();
+	/** Per-call wake policy by job id; absent means `"wake"` (the default). */
+	const notifyPolicy = new Map<string, NotifyPolicy>();
+	const notifyOfJob = (jobId: string): NotifyPolicy => notifyPolicy.get(jobId) ?? "wake";
 
 	const getConfig = (ctx?: ExtensionContext): AsyncBashConfig => {
 		if (!config) {
@@ -294,6 +312,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		manager = undefined;
 		managerSessionId = undefined;
 		userStopped.clear();
+		notifyPolicy.clear();
 		board.reset();
 	};
 
@@ -337,6 +356,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				onBackgroundComplete: (job) => {
 					// Generation guard: only the manager of the live session may deliver.
 					if (disposed || managerSessionId !== owner.sessionId) return;
+					// Silent jobs never enqueue a wake notice; they stay visible via bash_job.
+					if (notifyOfJob(job.id) === "silent") return;
 					pending.push(job);
 					scheduleIdleFlush(IDLE_FLUSH_DELAY_MS);
 				},
@@ -365,9 +386,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		};
 	};
 
-	/** Take undelivered completions and mark them delivered. */
+	/** Take undelivered wake completions and mark them delivered. Silent jobs never wake. */
 	const takePending = (): Job[] => {
-		const jobs = pending.filter((job) => !job.delivered);
+		const jobs = pending.filter((job) => !job.delivered && notifyOfJob(job.id) !== "silent");
 		pending = [];
 		for (const job of jobs) job.delivered = true;
 		return jobs;
@@ -549,6 +570,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		const info = job.info();
 		const tail = how !== "explicit" && manager ? manager.tail(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES) : undefined;
 		const after = seconds(Date.now() - info.startedAt);
+		const silent = notifyOfJob(job.id) === "silent";
 		const lines = [
 			how === "auto"
 				? `Command is still running after ${after}; it moved to the background as job ${info.id}. It has NOT completed.`
@@ -557,7 +579,9 @@ export default function asyncBash(pi: ExtensionAPI): void {
 					: `Command started in the background as job ${info.id}. It has NOT completed.`,
 			`Full output log: ${info.logPath}`,
 			info.timeoutMs ? `It will be killed if still running ${info.timeoutMs / 1000} seconds after launch.` : undefined,
-			`You will be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`,
+			silent
+				? `It is silent: you will NOT be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`
+				: `You will be notified when it finishes. To check, wait, or stop it, call bash_job with job_id "${info.id}"; read the log file for output.`,
 			tail?.text ? `Output so far${tail.truncated ? " (end)" : ""}:\n${tail.text}` : undefined,
 		].filter((line): line is string => line !== undefined);
 		return {
@@ -590,6 +614,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		job.delivered = true;
 		// A truncated result points at the log, so the job stays registered and its log stays in the disk budget.
 		if (!tail.truncated) mgr?.release(job);
+		// Foreground completions never wake; the policy entry is no longer needed either way.
+		notifyPolicy.delete(job.id);
 		let text = tail.text;
 		if (tail.truncated) text += `${text ? "\n\n" : ""}[Output truncated to the last lines. Full output: ${info.logPath}]`;
 		const error = errorForStatus(info);
@@ -642,6 +668,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			ctxRef = ctx;
 			const timeoutMs = resolveTimeoutMs(params.timeout);
+			const notify = resolveNotify(params.notify);
 			if (signal?.aborted) throw new Error("Command aborted");
 			const mgr = ensureManager(ctx);
 			const prefix = pi.getSettings().shellCommandPrefix;
@@ -654,12 +681,14 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				timeoutMs,
 				background: params.run_in_background === true,
 			});
+			notifyPolicy.set(job.id, notify);
 
 			if (params.run_in_background === true) {
 				if (!(await job.launched)) {
 					job.delivered = true;
 					const info = job.info();
 					mgr.release(job);
+					notifyPolicy.delete(job.id);
 					throw new Error(errorForStatus(info));
 				}
 				return runningResult(job, "explicit");
@@ -737,9 +766,12 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				const now = Date.now();
 				const rows = jobs.map((job) => {
 					const info = job.info();
-					return `${info.id}  ${info.status}${info.status === "exited" ? ` (${info.exitCode})` : ""}  ${seconds((info.endedAt ?? now) - info.startedAt)}  ${oneLine(info.command, 80)}`;
+					return `${info.id}  ${info.status}${info.status === "exited" ? ` (${info.exitCode})` : ""}  ${seconds((info.endedAt ?? now) - info.startedAt)}  ${oneLine(info.command, 80)}  notify:${notifyOfJob(info.id)}`;
 				});
-				return { content: [{ type: "text", text: rows.join("\n") }], details: { jobs: jobs.map((job) => job.info()) } };
+				return {
+					content: [{ type: "text", text: rows.join("\n") }],
+					details: { jobs: jobs.map((job) => ({ ...job.info(), notify: notifyOfJob(job.id) })) },
+				};
 			}
 			if (!params.job_id) throw new Error(`job_id is required for ${params.action}`);
 			const job = listed(mgr?.get(params.job_id));
@@ -754,10 +786,11 @@ export default function asyncBash(pi: ExtensionAPI): void {
 					await mgr.wait(job, STOP_WAIT_MS, signal);
 				}
 				job.delivered = true;
+				const notify = notifyOfJob(job.id);
 				const text = job.running
-					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath}`
-					: formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES);
-				return { content: [{ type: "text", text }], details: job.info() };
+					? `Stop requested for ${job.id}; it has not exited yet. Log: ${job.logPath} Notify: ${notify}.`
+					: `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
+				return { content: [{ type: "text", text }], details: { ...job.info(), notify } };
 			}
 
 			if (params.action === "wait") {
@@ -768,16 +801,18 @@ export default function asyncBash(pi: ExtensionAPI): void {
 
 			if (job.running) {
 				const tail = mgr.tail(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES);
+				const notify = notifyOfJob(job.id);
 				const text = [
-					`Job ${job.id} is still running (${seconds(Date.now() - job.startedAt)} elapsed). Log: ${job.logPath}`,
+					`Job ${job.id} is still running (${seconds(Date.now() - job.startedAt)} elapsed). Log: ${job.logPath} Notify: ${notify}.`,
 					tail.text ? `Output so far:\n${tail.text}` : "No output yet.",
 				].join("\n");
-				return { content: [{ type: "text", text }], details: job.info() };
+				return { content: [{ type: "text", text }], details: { ...job.info(), notify } };
 			}
 			job.delivered = true;
 			const info = job.info();
-			const text = formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES);
-			return { content: [{ type: "text", text }], details: info };
+			const notify = notifyOfJob(job.id);
+			const text = `${formatCompletion(job, NOTIFY_TAIL_BYTES, NOTIFY_TAIL_LINES)}\nNotify: ${notify}.`;
+			return { content: [{ type: "text", text }], details: { ...info, notify } };
 		},
 	});
 }

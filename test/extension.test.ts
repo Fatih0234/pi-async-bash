@@ -27,7 +27,7 @@ describe("registration and config", () => {
 		assert.deepEqual([...rt.tools.keys()].sort(), ["bash", "bash_job"]);
 		for (const name of ["exec", "wait", "exec_command", "write_stdin", "apply_patch"]) assert.equal(rt.tools.has(name), false);
 		const params = (rt.tools.get("bash") as any).parameters;
-		assert.deepEqual(Object.keys(params.properties).sort(), ["command", "description", "run_in_background", "timeout"]);
+		assert.deepEqual(Object.keys(params.properties).sort(), ["command", "description", "notify", "run_in_background", "timeout"]);
 		assert.deepEqual(params.required, ["command"]);
 	});
 
@@ -449,6 +449,55 @@ describe("session lifecycle", () => {
 		assert.match(text(await rt.job({ action: "list" })), new RegExp(result.details.jobId));
 		assert.equal(text(await rt.bash({ command: 'echo "$PI_PROVIDER/$PI_MODEL"' })), "p2/m2");
 		assert.match(text(await rt.job({ action: "stop", job_id: result.details.jobId })), /was stopped/);
+	});
+});
+
+describe("notify policy", () => {
+	test("silent job completion enqueues no wake notice", async () => {
+		const rt = runtime("silent-1");
+		const result = await rt.bash({ command: "sleep 0.5; echo silent-done", notify: "silent" });
+		assert.equal(result.details.background, true);
+		assert.match(text(result), /NOT be notified/);
+		const jobId = result.details.jobId as string;
+		await sleep(1200);
+		assert.strictEqual(noticeOf(rt).length, 0);
+		assert.deepEqual(await rt.emit("turn_end", { outcome: "completed" }), [undefined]);
+		const status = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(status), /silent-done/);
+		assert.match(text(status), /Notify: silent/);
+		assert.equal((status.details as any).notify, "silent");
+		const list = await rt.job({ action: "list" });
+		assert.match(text(list), new RegExp(`${jobId}.*notify:silent`));
+	});
+
+	test("default and explicit wake still notify", async () => {
+		const rt = runtime("wake-1");
+		const result = await rt.bash({ command: "sleep 0.5; echo wake-done", notify: "wake" });
+		assert.equal(result.details.background, true);
+		assert.match(text(result), /will be notified/);
+		await waitFor(() => noticeOf(rt).length === 1, 3000, "wake notification");
+		assert.equal(noticeOf(rt)[0]!.options?.triggerTurn, true);
+		assert.match(noticeOf(rt)[0]!.message.content, /wake-done/);
+	});
+
+	test("silent explicit-background job stays visible via wait without ever waking", async () => {
+		const rt = runtime("silent-2");
+		const result = await rt.bash({ command: "sleep 0.4; echo silent-bg-done", run_in_background: true, notify: "silent" });
+		assert.equal(result.details.background, true);
+		const jobId = result.details.jobId as string;
+		const running = await rt.job({ action: "status", job_id: jobId });
+		assert.match(text(running), /Notify: silent/);
+		const waited = await rt.job({ action: "wait", job_id: jobId, timeout: 5 });
+		assert.match(text(waited), /silent-bg-done/);
+		assert.match(text(waited), /Notify: silent/);
+		await sleep(600);
+		assert.strictEqual(noticeOf(rt).length, 0);
+		assert.deepEqual(await rt.emit("turn_end", { outcome: "completed" }), [undefined]);
+	});
+
+	test("invalid notify is rejected", async () => {
+		const rt = runtime("silent-bad");
+		await assert.rejects(rt.bash({ command: "true", notify: "loud" }), /Invalid notify/);
 	});
 });
 
