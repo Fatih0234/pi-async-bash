@@ -240,6 +240,19 @@ describe("stop ownership and cleanup", () => {
 		assert.equal(job.cleanupTimer, undefined);
 	});
 
+	test('stop() issued after natural exit resolves to the exit outcome, not "stopped"', async () => {
+		const { mgr } = make();
+		const job = mgr.start({ command: "exit 7", cwd: "/" });
+		// Let the OS process exit while blocking Node from observing the exit event,
+		// so requestStop races the pending exit delivery.
+		const end = Date.now() + 500;
+		while (Date.now() < end) {}
+		const res = await mgr.requestStop(job, "stopped");
+		assert.notStrictEqual(res.status, "stopped");
+		assert.equal(res.status, "exited");
+		assert.equal(res.exitCode, 7);
+	});
+
 	test("a TERM-ignoring descendant is SIGKILLed after the shell exits", async () => {
 		const { mgr } = make({ killGraceMs: 400 });
 		const job = mgr.start({ command: "(trap '' TERM; exec sleep 30) & echo $!; wait", cwd: "/", background: true });

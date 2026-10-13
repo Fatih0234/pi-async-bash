@@ -508,8 +508,10 @@ export default function asyncBash(pi: ExtensionAPI): void {
 				const job = mgr?.get(jobId);
 				if (!mgr || !job?.running) return false;
 				// Not marked delivered: the model learns of the stop through the usual completion path.
-				userStopped.add(job.id);
 				void mgr.requestStop(job, "stopped");
+				// First-reason-wins: only phrase as user-stopped when this request recorded `stopped`.
+				// A late stop racing natural exit records nothing and stays truthful.
+				if (job.stopReason === "stopped") userStopped.add(job.id);
 				return true;
 			},
 		},
@@ -744,6 +746,8 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			if (!mgr || !job) throw new Error(`Unknown job ${params.job_id} (jobs belong to the current session; finished jobs are kept for a limited time).`);
 
 			if (params.action === "stop") {
+				// Delegates truthfulness to the manager's first-reason-wins requestStop:
+				// a stop on a settled job returns its recorded outcome, never synthesizes `stopped`.
 				if (job.running) {
 					job.delivered = true;
 					void mgr.requestStop(job, "stopped");

@@ -222,6 +222,30 @@ function groupAlive(pid: number): boolean {
 	}
 }
 
+/**
+ * Synchronous OS-level check for a leader that exited before Node delivered its
+ * `exit` event (SIGCHLD is observed on the next tick). A zombie (`Z`) or gone
+ * (`X`/ENOENT) leader means a stop request raced a natural exit: the caller must
+ * not synthesize `stopped` or send signals, but return the pending natural outcome.
+ */
+function leaderExitedBeforeExitEvent(job: Job): boolean {
+	const child = job.child;
+	if (child && (child.exitCode !== null || child.signalCode !== null)) return true;
+	const pid = job.pid;
+	if (!pid || process.platform === "win32") return false;
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return false;
+		const state = stat.slice(close + 2, close + 3);
+		return state === "Z" || state === "X" || state === "x";
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ESRCH") return true;
+		return false;
+	}
+}
+
 const TRIM_HEADER = (dropped: number) => `[pi-async-bash: ${dropped} earlier bytes removed; output exceeded the log limit]\n`;
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: terminal escape sequences
@@ -462,6 +486,10 @@ export class JobManager {
 	 */
 	requestStop(job: Job, reason: StopReason): Promise<JobInfo> {
 		if (!job.running || job.stopReason) return job.done;
+		// Stop-race hardening: the leader may already be a zombie/gone at the OS level
+		// while `job.running` is still true (exit event pending). Synthesizing `stopped`
+		// then would lie; return the pending natural outcome with no signals or reason rewrite.
+		if (leaderExitedBeforeExitEvent(job)) return job.done;
 		job.stopReason = reason;
 		const pid = job.pid;
 		if (!pid) return job.done;
