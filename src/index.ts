@@ -281,7 +281,7 @@ const bashSchema = Type.Object({
 	task_id: Type.Optional(
 		Type.String({
 				description:
-				"Optional task link (experimental): recorded verbatim as task_id on this job's event-log lines only. Max 256 chars, no control characters.",
+				"Optional task link (experimental): when you are working on a task, pass that task's ID here so this job's start and completion can be matched to it later. Recorded verbatim as task_id on this job's event-log lines only. Max 256 chars, no control characters.",
 		}),
 	),
 });

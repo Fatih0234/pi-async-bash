@@ -1134,4 +1134,10 @@ describe("task_id event linkage (issue #8, extension)", () => {
 		await assert.rejects(rt.bash({ command: "echo hi", task_id: "abc\tdef" }), /Invalid task_id/);
 		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
 	});
+
+	test("task_id description tells the agent when to pass its task ID", () => {
+		const rt = runtime("taskid-guidance");
+		const taskId = (rt.tools.get("bash") as any).parameters.properties.task_id;
+		assert.match(taskId.description, /working on a task/i);
+	});
 });
