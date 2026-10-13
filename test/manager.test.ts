@@ -399,6 +399,26 @@ describe("event log", () => {
 		assert.equal(settled.status, info.status);
 		assert.equal(typeof settled.ts, "number");
 	});
+
+	test("settled carries exitCode, started carries none", async () => {
+		const dir = tempDir();
+		const logPath = join(dir, "events.jsonl");
+		const { mgr } = make({ eventLogPath: logPath });
+		const failing = mgr.start({ command: "exit 1", cwd: "/" });
+		const clean = mgr.start({ command: "true", cwd: "/" });
+		const [failingInfo, cleanInfo] = await Promise.all([failing.done, clean.done]);
+		assert.equal(failingInfo.exitCode, 1);
+		assert.equal(cleanInfo.exitCode, 0);
+		const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+		assert.strictEqual(lines.length, 4);
+		const events = lines.map((line) => JSON.parse(line));
+		for (const started of events.filter((e) => e.event === "started")) {
+			assert.ok(!("exitCode" in started), "started carries no exitCode");
+		}
+		const byId = new Map(events.map((e) => [`${e.event}:${e.job_id}`, e]));
+		assert.equal(byId.get(`settled:${failing.id}`)?.exitCode, 1);
+		assert.equal(byId.get(`settled:${clean.id}`)?.exitCode, 0);
+	});
 });
 
 describe("log helpers", () => {

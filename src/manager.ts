@@ -41,13 +41,15 @@ export type JobChange = "start" | "handoff" | "stop" | "finish";
 
 /**
  * One line of the `PI_ASYNC_BASH_EVENT_LOG` JSONL contract. `started` carries no
- * `status`; `settled` carries the final first-reason-wins status. `ts` is epoch ms.
+ * `status` and no `exitCode`; `settled` carries the final first-reason-wins status
+ * plus the process `exitCode`. `ts` is epoch ms.
  */
 export interface JobEvent {
 	event: "started" | "settled";
 	job_id: string;
 	command: string;
 	status?: JobStatus;
+	exitCode?: number | null;
 	ts: number;
 }
 
@@ -606,7 +608,7 @@ export class JobManager {
 		const entry: JobEvent =
 			event === "started"
 				? { event, job_id: job.id, command: job.command, ts: this.opts.now() }
-				: { event, job_id: job.id, command: job.command, status: job.status, ts: this.opts.now() };
+				: { event, job_id: job.id, command: job.command, status: job.status, exitCode: job.exitCode, ts: this.opts.now() };
 		try {
 			fs.mkdirSync(dirname(path), { recursive: true });
 			fs.appendFileSync(path, `${JSON.stringify(entry)}\n`);
