@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { dirname, join } from "node:path";
 import { after, describe, test } from "node:test";
@@ -922,5 +923,117 @@ describe("ready watch across stop (issues #1)", () => {
 		await waitFor(() => noticeOf(rt2).length === 1, 5000, "truth-case later match notifies");
 		await rt2.job({ action: "stop", job_id: id2 });
 		await sleep(300);
+	});
+});
+
+describe("event log startup validation (issue #4)", () => {
+	test("(a) directory path warns in start text and jobs run unlogged", async () => {
+		const dir = tempDir("pab-evt-dir-");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = dir; // a directory, not a file
+		try {
+			const rt = runtime("evt-dir");
+			const result = await rt.bash({ command: "echo dir-unlogged", run_in_background: true });
+			const startText = text(result);
+			assert.match(startText, /started in the background/, "job still starts");
+			assert.match(startText, /event log disabled/, "model-visible warning in start text");
+			assert.match(startText, /unlogged/, "warning says jobs run unlogged");
+			const waited = await rt.job({ action: "wait", job_id: result.details.jobId, timeout: 5 });
+			assert.match(text(waited), /exited with code 0/, "lifecycle never breaks for logging's sake");
+			assert.match(text(waited), /dir-unlogged/);
+			assert.deepEqual(fs.readdirSync(dir), [], "no event file is created");
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+
+	test("(b) FIFO path warns in start text and jobs run unlogged (no hang)", async () => {
+		const dir = tempDir("pab-evt-fifo-");
+		const fifo = join(dir, "events.jsonl");
+		assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+		process.env.PI_ASYNC_BASH_EVENT_LOG = fifo;
+		try {
+			const rt = runtime("evt-fifo");
+			// Pre-fix this hangs inside the synchronous append with no reader; the
+			// validation must reject the FIFO before any append is attempted.
+			const result = await rt.bash({ command: "echo fifo-unlogged", run_in_background: true });
+			const startText = text(result);
+			assert.match(startText, /event log disabled/, "model-visible warning in start text");
+			assert.match(startText, /unlogged/, "warning says jobs run unlogged");
+			const waited = await rt.job({ action: "wait", job_id: result.details.jobId, timeout: 5 });
+			assert.match(text(waited), /exited with code 0/, "lifecycle never breaks for logging's sake");
+			assert.match(text(waited), /fifo-unlogged/);
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+
+	test("(c) unwritable path warns in start text and jobs run unlogged", async () => {
+		const dir = tempDir("pab-evt-ro-");
+		fs.chmodSync(dir, 0o555);
+		process.env.PI_ASYNC_BASH_EVENT_LOG = join(dir, "events.jsonl");
+		try {
+			const rt = runtime("evt-ro");
+			const result = await rt.bash({ command: "echo ro-unlogged", run_in_background: true });
+			const startText = text(result);
+			assert.match(startText, /event log disabled/, "model-visible warning in start text");
+			assert.match(startText, /unlogged/, "warning says jobs run unlogged");
+			const waited = await rt.job({ action: "wait", job_id: result.details.jobId, timeout: 5 });
+			assert.match(text(waited), /exited with code 0/, "lifecycle never breaks for logging's sake");
+			assert.match(text(waited), /ro-unlogged/);
+			assert.deepEqual(fs.readdirSync(dir), [], "no event file is created");
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+			fs.chmodSync(dir, 0o755);
+		}
+	});
+
+	test("(d) valid path logs with no warning", async () => {
+		const dir = tempDir("pab-evt-ok-");
+		const logPath = join(dir, "events.jsonl");
+		process.env.PI_ASYNC_BASH_EVENT_LOG = logPath;
+		try {
+			const rt = runtime("evt-ok");
+			const result = await rt.bash({ command: "echo valid-logged", run_in_background: true });
+			assert.doesNotMatch(text(result), /event log disabled/, "no warning when logging works");
+			const waited = await rt.job({ action: "wait", job_id: result.details.jobId, timeout: 5 });
+			assert.match(text(waited), /valid-logged/);
+			const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+			assert.equal(lines.length, 2, "started + settled are logged");
+		} finally {
+			delete process.env.PI_ASYNC_BASH_EVENT_LOG;
+		}
+	});
+});
+
+describe("coverage gaps (issue #7)", () => {
+	test("foreground job with ready_pattern delivers its output with no ready notice", async () => {
+		const rt = runtime("fg-ready", "off"); // off: wait for completion in the foreground
+		const result = await rt.bash({ command: "echo READY-FG-LINE", ready_pattern: "READY-FG" });
+		assert.equal(result.details.background, undefined, "job stays in the foreground");
+		assert.equal(text(result), "READY-FG-LINE");
+		await sleep(600);
+		assert.strictEqual(noticeOf(rt).length, 0, "foreground match never wakes (owner filter + drop path)");
+		assert.deepEqual(await rt.emit("turn_end", { outcome: "completed" }), [undefined]);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+
+	test("non-string and empty ready_pattern are rejected at extension level", async () => {
+		const rt = runtime("ready-invalid-ext");
+		await assert.rejects(rt.bash({ command: "echo hi", ready_pattern: 123 }), /Invalid ready_pattern/);
+		await assert.rejects(rt.bash({ command: "echo hi", ready_pattern: null }), /Invalid ready_pattern/);
+		await assert.rejects(rt.bash({ command: "echo hi", ready_pattern: "" }), /Invalid ready_pattern/);
+		assert.equal(text(await rt.job({ action: "list" })), "No background jobs in this session.");
+	});
+
+	test("stop on a settled job returns the recorded completion", async () => {
+		const rt = runtime("stop-settled");
+		const result = await rt.bash({ command: "echo settled-stop", run_in_background: true });
+		const jobId = result.details.jobId as string;
+		const waited = await rt.job({ action: "wait", job_id: jobId, timeout: 5 });
+		assert.match(text(waited), /exited with code 0/);
+		const stopped = await rt.job({ action: "stop", job_id: jobId });
+		const stoppedText = text(stopped);
+		assert.match(stoppedText, /exited with code 0/, "stop reports the recorded outcome");
+		assert.doesNotMatch(stoppedText, /was stopped/, "stop never synthesizes stopped after exit");
 	});
 });

@@ -27,6 +27,7 @@ import {
 	type JobManagerOptions,
 	MAX_TIMER_MS,
 	pruneSessionLogDirs,
+	validateEventLogPath,
 } from "./manager.ts";
 import { JobBoard, type JobSource } from "./ui/board.ts";
 import { type BashDetails, createBashRenderers } from "./ui/bash-row.ts";
@@ -56,8 +57,17 @@ const DEFAULT_FOREGROUND_MS = 10000;
 export interface AsyncBashConfig {
 	/** Automatic handoff budget in ms; null waits for completion (explicit background still works). */
 	foregroundMs: number | null;
-	/** JSONL job-event log path (`PI_ASYNC_BASH_EVENT_LOG`); undefined disables the log. */
+	/**
+	 * Validated JSONL job-event log path: a writable regular file proven once when the
+	 * config is first resolved. Undefined disables the log for the session.
+	 */
 	eventLogPath: string | undefined;
+	/**
+	 * Model-visible notice when logging was requested but validation failed (issue #4).
+	 * Surfaced in the `bash` result text so the model knows the log is absent.
+	 * Undefined when logging is on or was never configured.
+	 */
+	eventLogWarning: string | undefined;
 	logBase: string;
 	manager: Partial<Omit<JobManagerOptions, "logDir" | "onBackgroundComplete">>;
 }
@@ -154,6 +164,9 @@ export function resolveConfig(
 	return {
 		foregroundMs,
 		eventLogPath: eventLogRaw ? eventLogRaw : undefined,
+		// No warning yet: resolveConfig stays pure (no filesystem I/O). The extension's
+		// getConfig validates once and fills this in.
+		eventLogWarning: undefined,
 		logBase: env.PI_ASYNC_BASH_LOG_DIR || join(tmpdir(), `pi-async-bash-${uid}`),
 		manager,
 	};
@@ -348,9 +361,20 @@ export default function asyncBash(pi: ExtensionAPI): void {
 	const getConfig = (ctx?: ExtensionContext): AsyncBashConfig => {
 		if (!config) {
 			const flag = pi.getFlag("bash-foreground-ms");
-			config = resolveConfig(typeof flag === "string" ? flag : undefined, ctx?.mode ?? ctxRef?.mode, process.env, pi.getSettings());
+			const resolved = resolveConfig(typeof flag === "string" ? flag : undefined, ctx?.mode ?? ctxRef?.mode, process.env, pi.getSettings());
+			// Startup validation, once per extension instance (not per call or per event):
+			// a bad path disables logging for the session with a model-visible warning,
+			// and the manager only ever sees a proven path or undefined.
+			const validated = validateEventLogPath(resolved.eventLogPath);
+			config = { ...resolved, eventLogPath: validated.path, eventLogWarning: validated.warning };
 		}
 		return config;
+	};
+
+	/** Append the event-log warning, if any, so the model knows the log is absent. */
+	const withEventLogWarning = (text: string): string => {
+		const warning = getConfig().eventLogWarning;
+		return warning ? `${text}\n${warning}` : text;
 	};
 
 	const shutdownManager = () => {
@@ -720,7 +744,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 			tail?.text ? `Output so far${tail.truncated ? " (end)" : ""}:\n${tail.text}` : undefined,
 		].filter((line): line is string => line !== undefined);
 		return {
-			content: [{ type: "text", text: lines.join("\n") }],
+			content: [{ type: "text", text: withEventLogWarning(lines.join("\n")) }],
 			details: {
 				jobId: info.id,
 				status: "running",
@@ -758,7 +782,7 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		if (tail.truncated) text += `${text ? "\n\n" : ""}[Output truncated to the last lines. Full output: ${info.logPath}]`;
 		const error = errorForStatus(info);
 		if (info.status === "aborted" || info.status === "spawn_error" || info.status === "shutdown") {
-			throw new Error(text ? `${text}\n\n${error}` : error);
+			throw new Error(withEventLogWarning(text ? `${text}\n\n${error}` : error!));
 		}
 		const details: BashDetails = {
 			jobId: info.id,
@@ -777,13 +801,13 @@ export default function asyncBash(pi: ExtensionAPI): void {
 		};
 		if (error) {
 			return {
-				content: [{ type: "text", text: text ? `${text}\n\n${error}` : error }],
+				content: [{ type: "text", text: withEventLogWarning(text ? `${text}\n\n${error}` : error) }],
 				details,
 				structuredContent,
 				isError: true,
 			} as AgentToolResult<BashDetails>;
 		}
-		return { content: [{ type: "text", text: text || "(no output)" }], details, structuredContent } as AgentToolResult<BashDetails>;
+		return { content: [{ type: "text", text: withEventLogWarning(text || "(no output)") }], details, structuredContent } as AgentToolResult<BashDetails>;
 	};
 
 	pi.registerTool({

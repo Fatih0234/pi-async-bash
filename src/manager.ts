@@ -593,6 +593,68 @@ export function createSessionLogDir(base: string, sessionId: string): string {
 	return fs.mkdtempSync(join(base, `${safe}-`));
 }
 
+export interface EventLogValidation {
+	/** Usable log path, or undefined when logging must stay off for the session. */
+	path: string | undefined;
+	/** Model-visible reason logging is off; undefined when logging is on or was never configured. */
+	warning: string | undefined;
+}
+
+function errnoOf(err: unknown): string {
+	const code = (err as NodeJS.ErrnoException)?.code;
+	return code ?? String(err);
+}
+
+/**
+ * Validate the `PI_ASYNC_BASH_EVENT_LOG` path once at startup (issue #4). Creates parent
+ * directories as the per-event append does, then proves the path is a writable regular
+ * file with one open + fstat: directories, FIFOs, sockets, read-only locations, and
+ * create-time disk-full all fail here instead of hanging or warning on every event.
+ * Never throws: on failure logging stays off for the session and `warning` carries the
+ * model-visible notice. The per-event try/catch stays as a second net for failures
+ * that appear after startup.
+ */
+export function validateEventLogPath(raw: string | undefined): EventLogValidation {
+	const trimmed = raw?.trim();
+	if (!trimmed) return { path: undefined, warning: undefined };
+	const disabled = (detail: string): EventLogValidation => ({
+		path: undefined,
+		warning: `[pi-async-bash: event log disabled (${detail}); jobs run unlogged]`,
+	});
+	try {
+		fs.mkdirSync(dirname(trimmed), { recursive: true });
+	} catch (err) {
+		return disabled(`cannot create parent directory for "${trimmed}": ${errnoOf(err)}`);
+	}
+	// Type check before opening: opening a FIFO for writing without a reader blocks, so an
+	// existing non-regular file is rejected without an open.
+	try {
+		const existing = fs.statSync(trimmed);
+		if (!existing.isFile()) return disabled(`"${trimmed}" is not a regular file`);
+	} catch (err) {
+		if (errnoOf(err) !== "ENOENT") return disabled(`cannot inspect "${trimmed}": ${errnoOf(err)}`);
+	}
+	let fd: number;
+	try {
+		fd = fs.openSync(
+			trimmed,
+			fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | (fs.constants.O_NONBLOCK ?? 0),
+		);
+	} catch (err) {
+		return disabled(`cannot open "${trimmed}" for appending: ${errnoOf(err)}`);
+	}
+	try {
+		if (!fs.fstatSync(fd).isFile()) return disabled(`"${trimmed}" is not a regular file`);
+	} catch (err) {
+		return disabled(`cannot inspect "${trimmed}": ${errnoOf(err)}`);
+	} finally {
+		try {
+			fs.closeSync(fd);
+		} catch {}
+	}
+	return { path: trimmed, warning: undefined };
+}
+
 /** Delete session log directories under `base` not modified for `maxAgeMs`. Best effort. */
 export function pruneSessionLogDirs(base: string, maxAgeMs: number, keep: string | undefined, now = Date.now()): void {
 	let names: string[];

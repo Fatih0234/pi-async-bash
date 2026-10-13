@@ -14,6 +14,7 @@ import {
 	pruneSessionLogDirs,
 	readLogTail,
 	ReadyLineMatcher,
+	validateEventLogPath,
 } from "../src/manager.ts";
 import { resolveConfig } from "../src/index.ts";
 import { alive, sleep, tempDir, waitFor } from "./helpers.ts";
@@ -648,5 +649,74 @@ describe("ready matcher incremental scans (issue #5)", () => {
 		// The scan seam stays O(new bytes) across the split pushes above.
 		const seam = matcher as unknown as { scannedBytes?: unknown };
 		assert.equal(typeof seam.scannedBytes, "number", "flush path keeps the scan seam");
+	});
+});
+
+describe("eventLogPath startup validation (issue #4)", () => {
+	test("blank disables, valid regular file passes", () => {
+		assert.equal(validateEventLogPath(undefined).path, undefined);
+		assert.equal(validateEventLogPath(undefined).warning, undefined);
+		assert.equal(validateEventLogPath("   ").path, undefined);
+		assert.equal(validateEventLogPath("   ").warning, undefined);
+		const dir = tempDir();
+		const logPath = join(dir, "events.jsonl");
+		const ok = validateEventLogPath(logPath);
+		assert.equal(ok.path, logPath);
+		assert.equal(ok.warning, undefined);
+	});
+
+	test("directory path is rejected", () => {
+		const dir = tempDir();
+		const rejected = validateEventLogPath(dir);
+		assert.equal(rejected.path, undefined);
+		assert.match(rejected.warning ?? "", /event log disabled/);
+		assert.match(rejected.warning ?? "", /unlogged/);
+	});
+
+	test("FIFO path is rejected without blocking", () => {
+		const dir = tempDir();
+		const fifo = join(dir, "events.jsonl");
+		assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+		// Must return, not hang: opening a FIFO for writing without a reader blocks,
+		// so validation must reject it before any open is attempted.
+		const rejected = validateEventLogPath(fifo);
+		assert.equal(rejected.path, undefined);
+		assert.match(rejected.warning ?? "", /event log disabled/);
+	});
+
+	test("unwritable path is rejected", () => {
+		const dir = tempDir();
+		fs.chmodSync(dir, 0o555);
+		try {
+			const rejected = validateEventLogPath(join(dir, "events.jsonl"));
+			assert.equal(rejected.path, undefined);
+			assert.match(rejected.warning ?? "", /event log disabled/);
+		} finally {
+			fs.chmodSync(dir, 0o755);
+		}
+	});
+});
+
+describe("coverage gaps (issue #7)", () => {
+	test("settled exitCode null (spawn_error) event shape", async () => {
+		const dir = tempDir();
+		const logPath = join(dir, "events.jsonl");
+		const { mgr } = make({ shell: "/nonexistent/shell-binary", eventLogPath: logPath });
+		const job = mgr.start({ command: "true", cwd: "/" });
+		assert.equal(await job.launched, false);
+		const info = await job.done;
+		assert.equal(info.status, "spawn_error");
+		assert.equal(info.exitCode, null);
+		const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line !== "");
+		assert.strictEqual(lines.length, 2);
+		const started = JSON.parse(lines[0]!);
+		assert.equal(started.event, "started");
+		assert.ok(!("exitCode" in started), "started carries no exitCode");
+		const settled = JSON.parse(lines[1]!);
+		assert.equal(settled.event, "settled");
+		assert.equal(settled.job_id, job.id);
+		assert.equal(settled.status, "spawn_error");
+		assert.ok("exitCode" in settled, "settled carries exitCode even when null");
+		assert.equal(settled.exitCode, null);
 	});
 });
